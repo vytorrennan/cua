@@ -1060,6 +1060,22 @@ fn wayland_window_crop(xid: u64) -> anyhow::Result<WaylandWindowCrop> {
             window.is_on_screen,
         );
     }
+    // The KWin effect runs inside the compositor, so the geometry it reports is
+    // compositor-attested in the same sense as the GNOME helper's GetRects.
+    // Pixel capture is a crop of the rendered output, so a covering window
+    // still shows in the crop.
+    if let Some(window) = kwin_helper::list_window_infos()
+        .and_then(|windows| windows.into_iter().find(|window| window.xid == xid))
+    {
+        return attested_wayland_crop(
+            xid,
+            window.x,
+            window.y,
+            window.width,
+            window.height,
+            window.is_on_screen,
+        );
+    }
     Err(surface_identity_unproven(
         xid,
         "no compositor-attested window geometry is available",
@@ -1107,6 +1123,18 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
             surface_identity_unproven(
                 xid,
                 "Hyprland target identity or toplevel export could not be verified",
+            )
+        });
+    }
+    if is_wayland() && kwin_helper::available() {
+        // KWin's ScreenShot2 renders the window's own buffer, so a covering
+        // window and the agent cursor never appear. Refuse rather than falling
+        // back to a stage crop, which would leak occluders into the frame.
+        return kwin_helper::capture_window(xid).map_err(|error| {
+            tracing::debug!("KWin target capture failed: {error:#}");
+            surface_identity_unproven(
+                xid,
+                "KWin could not capture this window (minimized, closed, or ScreenShot2 refused)",
             )
         });
     }
@@ -1184,6 +1212,11 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
         }
     }
     if is_wayland() {
+        if kwin_helper::available() {
+            if let Ok(png) = kwin_helper::capture_workspace() {
+                return Ok(png);
+            }
+        }
         // Tier 1: the opt-in GNOME compositor helper. It avoids probing
         // wlroots-only protocols and captures the Shell stage without consent.
         // If the helper is present but capture fails, do not fall through to
@@ -1455,8 +1488,30 @@ fn approach_pixel(px: u32, extent: u32) -> u32 {
 /// and the virtual pointer both read this, so a desktop screenshot pixel and a
 /// pointer coordinate always share one frame.
 pub(crate) fn compositor_logical_frame() -> Option<anyhow::Result<(u32, u32)>> {
-    hyprland::is_session()
-        .then(|| hyprland::screen_size().map(|(width, height, _scale)| (width, height)))
+    if hyprland::is_session() {
+        return Some(hyprland::screen_size().map(|(width, height, _scale)| (width, height)));
+    }
+    if kwin_helper::available() {
+        return Some((|| {
+            let geometry = kwin_helper::screen_geometry().ok_or_else(|| {
+                anyhow::anyhow!("KWin screen geometry is unavailable")
+            })?;
+            let width = geometry
+                .get("width")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            let height = geometry
+                .get("height")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            anyhow::ensure!(
+                width > 0 && height > 0,
+                "KWin logical screen frame is empty: {width}x{height}"
+            );
+            Ok((width, height))
+        })());
+    }
+    None
 }
 
 /// Pointer space for `zwlr_virtual_pointer_v1::motion_absolute`, as
@@ -1600,6 +1655,11 @@ pub fn activate_window_for_input_target(
     window_id: u64,
     target_pid: Option<u32>,
 ) -> anyhow::Result<()> {
+    if let Some(pid) = target_pid {
+        if kwin_helper::trusted_window_for_id(pid, window_id).is_some() {
+            return kwin_helper::activate(pid, window_id);
+        }
+    }
     if is_wayland() && hyprland::is_session() {
         // A full compositor address must never enter the generic protocol-id
         // or title-matching route. This observation-only adapter can attest an
@@ -1671,6 +1731,48 @@ pub fn activate_window_for_input_target(
 /// confirmed the exact PID/window pair, and restore the previously focused
 /// toplevel afterward. Global virtual-keyboard/libei input is refused when the
 /// compositor cannot provide this read-back contract.
+/// Wrap an action in the KWin target guard when the target is a KWin window.
+///
+/// KWin has no target-addressable input outside the in-process helper, so
+/// scroll and drag need the same activation/binding guard as click and typing.
+/// Other compositors keep their existing per-action activation and run `body`
+/// unchanged.
+pub fn with_kwin_target_foreground<T>(
+    pid: u32,
+    window_id: u64,
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if kwin_helper::trusted_window_for_id(pid, window_id).is_some() {
+        return kwin_helper::with_focused_window(pid, window_id, body);
+    }
+    body()
+}
+
+/// Route a click through the in-process KWin effect when `window_id` is a
+/// live KWin token owned by `pid`. Returns `None` for every other target so
+/// callers can fall through to their existing route unchanged.
+///
+/// `x`/`y` are window-local pixels, matching every other helper call.
+pub fn kwin_click_if_target(
+    pid: u32,
+    window_id: u64,
+    x: i32,
+    y: i32,
+    count: u32,
+    button: u8,
+) -> Option<anyhow::Result<()>> {
+    // `x`/`y` are window-local pixels. The KWin effect works in compositor
+    // (output) coordinates and validates the point against frameGeometry, so
+    // translate through the window origin before injecting — otherwise every
+    // click on a window that is not at (0, 0) lands at the wrong point.
+    let window = kwin_helper::trusted_window_for_id(pid, window_id)?;
+    let global_x = window.x.saturating_add(x);
+    let global_y = window.y.saturating_add(y);
+    Some(kwin_helper::with_focused_window(pid, window_id, || {
+        kwin_helper::click(window_id, global_x, global_y, count, button)
+    }))
+}
+
 pub fn with_target_foreground<T>(
     pid: u32,
     window_id: u64,
@@ -1779,6 +1881,11 @@ pub fn click(window_id: u64, x: i32, y: i32, count: u32, button: u8) -> anyhow::
 /// the actual libei dispatch.
 #[cfg(feature = "portal-input")]
 pub fn click_focused(x: i32, y: i32, count: u32, button: u8) -> anyhow::Result<()> {
+    if let Some(token) = kwin_helper::active_input_token() {
+        kwin_helper::click(token, x, y, count, button)?;
+        record_synth_cursor(x, y);
+        return Ok(());
+    }
     with_libei_fallback(
         || click_vptr(None, x, y, count, button, None),
         || {
@@ -1869,8 +1976,21 @@ fn click_vptr(
 /// tick emits an `axis_source(wheel)` + `axis_discrete(1)` pair through the
 /// virtual-pointer protocol, mirroring how a real wheel notch decomposes. The
 /// magnitude follows wl_pointer convention: ±10 (in wl_fixed = ×256) per tick.
-pub fn scroll(window_id: u64, direction: &str, amount: u32) -> anyhow::Result<()> {
-    scroll_at(window_id, None, direction, amount)
+pub fn scroll(
+    window_id: u64,
+    direction: &str,
+    amount: u32,
+    by: cua_driver_contract::ScrollBy,
+) -> anyhow::Result<()> {
+    scroll_at(window_id, None, direction, amount, by)
+}
+
+fn scroll_amount(amount: u32, by: cua_driver_contract::ScrollBy) -> u32 {
+    let amount = amount.max(1);
+    match by {
+        cua_driver_contract::ScrollBy::Line => amount,
+        cua_driver_contract::ScrollBy::Page => amount.saturating_mul(3),
+    }
 }
 
 /// Translate window-local screenshot coordinates into compositor output
@@ -1960,7 +2080,26 @@ pub fn scroll_at(
     point: Option<(i32, i32)>,
     direction: &str,
     amount: u32,
+    by: cua_driver_contract::ScrollBy,
 ) -> anyhow::Result<()> {
+    if let Some(token) = kwin_helper::active_input_token() {
+        let (x, y) = match point {
+            Some(point) => point,
+            None => {
+                let window = kwin_helper::window_for_token(token).ok_or_else(|| {
+                    anyhow::anyhow!("KWin window token {token} is no longer live")
+                })?;
+                (
+                    window.x + window.width as i32 / 2,
+                    window.y + window.height as i32 / 2,
+                )
+            }
+        };
+        kwin_helper::scroll(token, x, y, direction, amount, by)?;
+        record_synth_cursor(x, y);
+        return Ok(());
+    }
+    let amount = scroll_amount(amount, by);
     let direction = direction.to_string();
     with_libei_fallback(
         || scroll_vptr(Some(window_id), point, &direction, amount, None),
@@ -2080,6 +2219,11 @@ pub fn last_synth_cursor_pos() -> Option<(i32, i32)> {
 /// the compositor commits the warp before returning. Records the position in
 /// the synthetic-cursor registry so `last_synth_cursor_pos` can report it.
 pub fn move_cursor_absolute(window_id: Option<u64>, x: i32, y: i32) -> anyhow::Result<()> {
+    if let Some(token) = kwin_helper::active_input_token() {
+        kwin_helper::move_to(token, x, y)?;
+        record_synth_cursor(x, y);
+        return Ok(());
+    }
     with_libei_fallback(
         || move_cursor_absolute_vptr(window_id, x, y, None),
         || libei_move_absolute(x, y),
@@ -2128,6 +2272,11 @@ pub fn drag(
     button: u8,
 ) -> anyhow::Result<()> {
     let ((from_x, from_y), (to_x, to_y)) = (from, to);
+    if let Some(token) = kwin_helper::active_input_token() {
+        kwin_helper::drag(token, (from_x, from_y), (to_x, to_y), button)?;
+        record_synth_cursor(to_x, to_y);
+        return Ok(());
+    }
     with_libei_fallback(
         || {
             drag_vptr(
@@ -2280,6 +2429,32 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    if let Some(token) = kwin_helper::active_input_token() {
+        if let Some(window) = kwin_helper::window_for_token(token) {
+            let terminal = [
+                "konsole",
+                "terminal",
+                "alacritty",
+                "kitty",
+                "foot",
+                "wezterm",
+            ]
+            .iter()
+            .any(|name| window.app_name.to_ascii_lowercase().contains(name));
+            if (text.len() >= 16 || !text.is_ascii())
+                && !text.chars().any(|ch| ch.is_ascii_control() && ch != '\n')
+                && (!terminal || !text.contains('\n'))
+            {
+                return kwin_clipboard_paste(window.pid, token, text, terminal);
+            }
+        }
+        return kwin_helper::type_text(token, text);
+    }
+    if let Some(result) =
+        kwin_helper::with_active_window(|token| kwin_helper::type_text(token, text))
+    {
+        return result;
+    }
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "--"])
         .arg(text)
@@ -2301,6 +2476,13 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 /// headless wlroots seat dropping the first event from a second `wtype`
 /// process after the text has landed.
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
+    if let Some(token) = kwin_helper::active_input_token() {
+        kwin_helper::type_text(token, text)?;
+        let keycode = key_to_evdev(key).ok_or_else(|| {
+            anyhow::anyhow!("no evdev keycode mapping for key '{key}' (KWin path)")
+        })?;
+        return kwin_helper::press_key(token, keycode);
+    }
     let keysym = key_to_keysym(key);
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "-s", "30"])
@@ -2345,6 +2527,12 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
 
 /// Press one key while an outer exact-container focus guard is active.
 pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
+    if let Some(token) = kwin_helper::active_input_token() {
+        return kwin_press_key(token, key);
+    }
+    if let Some(result) = kwin_helper::with_active_window(|token| kwin_press_key(token, key)) {
+        return result;
+    }
     if is_inject_mode() {
         let (pid, window_id) = inject_focused_target()?;
         return inject_press_key(pid, window_id, key);
@@ -2371,6 +2559,9 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
 /// straight to wtype's `-k` so single-character keys and X keysym names work
 /// as-is. This is the Wayland equivalent of the X11 `send_key` modifier mask.
 pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
+    if kwin_helper::active_input_token().is_some() {
+        return hotkey_focused(keys);
+    }
     activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
@@ -2406,8 +2597,200 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// Press one key through the KWin effect, mapping the name to evdev.
+fn kwin_press_key(token: u64, key: &str) -> anyhow::Result<()> {
+    let keycode = key_to_evdev(key)
+        .ok_or_else(|| anyhow::anyhow!("no evdev keycode mapping for key '{key}' (KWin path)"))?;
+    kwin_helper::press_key(token, keycode)
+}
+
+/// Send a chord through the KWin effect as ordered evdev transitions.
+fn kwin_hotkey(token: u64, keys: &[String]) -> anyhow::Result<()> {
+    let (mods, final_key) = partition_modifiers(keys)?;
+    let mut codes = Vec::with_capacity(mods.len());
+    for modifier in &mods {
+        codes.push(match modifier.as_str() {
+            "ctrl" => 29,
+            "shift" => 42,
+            "alt" => 56,
+            "logo" | "super" | "meta" => 125,
+            other => anyhow::bail!("no evdev keycode mapping for modifier '{other}'"),
+        });
+    }
+    let keycode = key_to_evdev(&final_key)
+        .ok_or_else(|| anyhow::anyhow!("no evdev keycode mapping for key '{final_key}' (KWin path)"))?;
+    let mut transitions = Vec::with_capacity(codes.len() * 2 + 2);
+    transitions.extend(codes.iter().map(|code| (*code, true)));
+    transitions.push((keycode, true));
+    transitions.push((keycode, false));
+    transitions.extend(codes.iter().rev().map(|code| (*code, false)));
+    kwin_helper::key_sequence(token, &transitions)
+}
+
+/// Type text into one exact KWin window without activating it.
+///
+/// The effect's keymap covers printable ASCII, newline, and tab. Anything the
+/// keymap cannot represent is pasted through the clipboard as a separate run,
+/// which gives the same result for text fields. Control characters stay on the
+/// key path so a multi-line paste never triggers a terminal's paste dialog.
+pub fn kwin_type_text_background(
+    pid: u32,
+    token: u64,
+    text: &str,
+    terminal: bool,
+) -> anyhow::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let typeable = |ch: char| ch == '\n' || ch == '\t' || (ch.is_ascii() && !ch.is_ascii_control());
+    // Insert bulk text in one transaction. Native formats are snapshotted
+    // and restored, so this also preserves rich text and image clipboards.
+    // Short text and explicit control characters retain key semantics.
+    if (text.len() >= 16 || !text.is_ascii())
+        && !text.chars().any(|ch| ch.is_ascii_control() && ch != '\n')
+        && (!terminal || !text.contains('\n'))
+    {
+        return kwin_clipboard_paste(pid, token, text, terminal);
+    }
+    if text.chars().all(typeable) {
+        return kwin_helper::with_focused_window(pid, token, || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let result = kwin_helper::type_text(token, text);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            result
+        });
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        Type,
+        Paste,
+    }
+    let mut mode = Mode::Type;
+    let mut run = String::new();
+    let flush = |mode: Mode, run: &mut String| -> anyhow::Result<()> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        let text = std::mem::take(run);
+        match mode {
+            Mode::Type => kwin_helper::type_text_background(token, &text),
+            Mode::Paste => kwin_clipboard_paste(pid, token, &text, terminal),
+        }
+    };
+    for ch in text.chars() {
+        if !typeable(ch) {
+            // A paste run may contain printable ASCII; keep it in one paste to
+            // avoid a paste per character. It must stop at a control character.
+            if mode == Mode::Type {
+                flush(Mode::Type, &mut run)?;
+                mode = Mode::Paste;
+            }
+            run.push(ch);
+        } else if ch == '\n' || ch == '\t' || ch == '\r' {
+            if mode == Mode::Paste {
+                flush(Mode::Paste, &mut run)?;
+                mode = Mode::Type;
+            }
+            run.push(ch);
+        } else {
+            // Printable ASCII: extends whichever run is open.
+            run.push(ch);
+        }
+    }
+    flush(mode, &mut run)
+}
+
+/// Paste one run through the clipboard, then put the user's text back. The
+/// paste keystroke is target-bound and does not activate the window.
+fn kwin_clipboard_paste(pid: u32, token: u64, text: &str, terminal: bool) -> anyhow::Result<()> {
+    use cua_driver_core::clipboard::ClipboardBackend;
+
+    static PASTE_LOCK: Mutex<()> = Mutex::new(());
+    static CLIPBOARD: OnceLock<crate::clipboard::LinuxClipboard> = OnceLock::new();
+    let _paste_guard = PASTE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("KWin paste lock poisoned"))?;
+    let clipboard = CLIPBOARD.get_or_init(crate::clipboard::LinuxClipboard::new);
+    let previous = clipboard
+        .snapshot()
+        .map_err(|error| anyhow::anyhow!("clipboard snapshot failed before typing: {error}"))?;
+    clipboard
+        .write_text(text.to_owned())
+        .map_err(|error| anyhow::anyhow!("clipboard write failed: {error}"))?;
+    // Ctrl+Shift+V is the clipboard paste shortcut in the supported terminal
+    // emulators. Shift+Insert intermittently reached Konsole as a raw Insert
+    // escape sequence during focus changes. Ctrl+V belongs to the shell.
+    let transitions: &[(u32, bool)] = if terminal {
+        &[
+            (29u32, true),
+            (42u32, true),
+            (47u32, true),
+            (47u32, false),
+            (42u32, false),
+            (29u32, false),
+        ]
+    } else {
+        &[(29u32, true), (47u32, true), (47u32, false), (29u32, false)]
+    };
+    let paste = kwin_helper::with_focused_window(pid, token, || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // The focus transaction owns restoration. The helper chooses its
+        // non-restoring key-sequence method so no delayed timer can steal
+        // focus back after this transaction has ended.
+        let result = kwin_helper::key_sequence_background(token, transitions);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        result
+    });
+    // Preserve a new clipboard value supplied by the user during dispatch.
+    // Restore all original payload formats, including rich text and images.
+    if clipboard.read_text().ok().flatten().as_deref() == Some(text) {
+        clipboard.restore(previous).map_err(|error| {
+            anyhow::anyhow!("clipboard restoration failed after typing: {error}")
+        })?;
+    }
+    paste
+}
+
+/// Press a named key in one exact KWin window without activating it.
+pub fn kwin_press_key_background(token: u64, key: &str) -> anyhow::Result<()> {
+    let keycode = key_to_evdev(key).ok_or_else(|| {
+        anyhow::anyhow!("no evdev keycode mapping for key '{key}' (KWin path)")
+    })?;
+    kwin_helper::press_key_background(token, keycode)
+}
+
+/// Send a chord to one exact KWin window without activating it.
+pub fn kwin_hotkey_background(token: u64, keys: &[String]) -> anyhow::Result<()> {
+    let (mods, final_key) = partition_modifiers(keys)?;
+    let mut codes = Vec::with_capacity(mods.len());
+    for modifier in &mods {
+        codes.push(match modifier.as_str() {
+            "ctrl" => 29,
+            "shift" => 42,
+            "alt" => 56,
+            "logo" | "super" | "meta" => 125,
+            other => anyhow::bail!("no evdev keycode mapping for modifier '{other}'"),
+        });
+    }
+    let keycode = key_to_evdev(&final_key)
+        .ok_or_else(|| anyhow::anyhow!("no evdev keycode mapping for key '{final_key}' (KWin path)"))?;
+    let mut transitions = Vec::with_capacity(codes.len() * 2 + 2);
+    transitions.extend(codes.iter().map(|code| (*code, true)));
+    transitions.push((keycode, true));
+    transitions.push((keycode, false));
+    transitions.extend(codes.iter().rev().map(|code| (*code, false)));
+    kwin_helper::key_sequence_background(token, &transitions)
+}
+
 /// Send a chord while an outer exact-container focus guard is active.
 pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
+    if let Some(token) = kwin_helper::active_input_token() {
+        return kwin_hotkey(token, keys);
+    }
+    if let Some(result) = kwin_helper::with_active_window(|token| kwin_hotkey(token, keys)) {
+        return result;
+    }
     if is_inject_mode() {
         let (pid, window_id) = inject_focused_target()?;
         return inject_hotkey(pid, window_id, keys);
@@ -2771,6 +3154,7 @@ fn key_to_evdev(key: &str) -> Option<u32> {
         "space" => 57,                   // KEY_SPACE
         "backspace" => 14,               // KEY_BACKSPACE
         "delete" | "del" => 111,         // KEY_DELETE
+        "insert" | "ins" => 110,         // KEY_INSERT
         "up" => 103,                     // KEY_UP
         "down" => 108,                   // KEY_DOWN
         "left" => 105,                   // KEY_LEFT

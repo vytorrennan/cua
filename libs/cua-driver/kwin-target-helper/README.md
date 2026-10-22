@@ -5,13 +5,15 @@ the portable `cua-driver` binary and must be built against the user's installed
 KWin/Qt/KF6 development files. Do not use a helper built for a different KWin
 or Qt ABI.
 
-The helper is intentionally **read-only**. It provides trusted KWin window
-identity and state metadata: stable opaque tokens, PID, geometry,
-active/minimized state, and stacking order. It does not expose window activation
-or input mutation methods. KWin portal/libei input is focus-bound, so focus can
-change between any focus check and compositor-side input processing. Cua
-therefore refuses raw target-addressed KWin keyboard/pointer actions until a
-target-bound KWin input path exists.
+This fork adds protocol-v3 input methods alongside trusted window metadata.
+The helper resolves opaque window tokens inside KWin, validates callers and
+targets, and delivers input through the compositor. The driver verifies that
+the D-Bus service belongs to the current user's KWin process and binds the
+requested PID to its window token.
+
+Background pointer actions temporarily raise occluded targets and restore the
+pointer, previous active window and stacking order. Keyboard and wheel actions
+briefly activate their target. Applications observe those focus changes.
 
 ## Requirements
 
@@ -56,17 +58,56 @@ qdbus6 org.kde.KWin /Effects loadEffect cua_kwin_target_helper
 The helper exposes the Cua-owned service `org.cua.KWinTarget` only while the
 effect is loaded by the current `kwin_wayland` process. Verify the service
 owner, protocol version, and target snapshots before trusting identity data.
-The exported D-Bus surface is deliberately limited to `GetVersion` and
-`GetWindows`.
+The D-Bus surface includes version/build and window metadata, activation,
+geometry, pointer and keyboard methods, and background variants. The driver
+uses a persistent native D-Bus connection rather than a subprocess per call.
 
 ## Input safety boundary
 
-Portal/libei events are delivered according to compositor focus when KWin
-processes them. A target focus check immediately before dispatch cannot bind the
-later event to that target, so adding more checks does not remove the race.
-Until a future KWin integration can bind the mutation itself to an exact target,
-Cua fails closed rather than sending raw focus-based input to a requested KWin
-window.
+Target validation and input delivery run inside the compositor. Shortcut
+transitions yield through timers so applications can process modifier changes.
+Every keydown revalidates the target. Keyups still release when a shortcut
+closes the window, and aborted requests release their owned keys. Overlapping
+writes return `input_busy` while metadata remains readable. The driver does
+not replay dispatched input automatically after a transport error.
+
+Bulk text and Unicode use clipboard paste. Clipboard transactions preserve
+native payload formats, support empty selections and retain a different text
+value copied during dispatch. Konsole uses Ctrl+Shift+V. Short text and control
+characters retain physical key semantics. Background scrolling acknowledges
+after pointer/focus/stack restoration, preserving sequential batch ordering.
+
+Window and workspace captures use KWin ScreenShot2, including direct RGBX8888
+decoding. Window captures exclude separate popup and tooltip windows; use a
+desktop capture for those. Drag requests run sequentially because the
+compositor has one synthetic pointer.
+
+## Verification and limits
+
+Verified on a two-core KDE Plasma 6.8 Wayland VM with one output. Release builds
+and focused transport/native clipboard tests passed. Twelve browser/terminal
+checks passed under two temporary CPU workers and 576 MiB of memory load.
+Checks included actual destination pages, exact saved text, Unicode terminal
+execution, foreground/background shortcuts, Backspace, overlap refusal, key
+release after window closure, scrolling and capture color/alpha. The broader
+Cargo test-binary build was cancelled after memory contention; the complete
+Cargo suite and cross-platform desktop matrix were not completed.
+
+Representative CLI measurements inside the VM, excluding SSH and model time:
+
+| Action | Before optimization | After optimization |
+| --- | ---: | ---: |
+| Click | 1.424 s | 0.245 s |
+| Scroll | 3.344 s | 0.828 s |
+| Shortcut | 3.368 s | 0.782 s |
+| Desktop capture | 1.422 s | 0.436 s |
+| Type 200 ASCII characters | 4.840 s | 1.657 s |
+
+Repeated calls use medians; the text case is one sample. A later three-run
+typing check took 1.066–1.782 seconds, so sub-second typing is not established.
+The optional agent cursor overlay was disabled for these measurements.
+More aggressive shortcut timings missed a Save and were discarded.
+Multi-monitor behavior and other compositor/Qt versions require verification.
 
 ## ABI and rollback
 

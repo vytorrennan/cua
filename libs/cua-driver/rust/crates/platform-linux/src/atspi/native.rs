@@ -1079,6 +1079,123 @@ fn correlate_hyprland_frame(
     Some(frame.ordinal)
 }
 
+#[derive(Debug)]
+struct KwinFrame {
+    ordinal: usize,
+    title: String,
+    browser_root: bool,
+    size: Option<(i32, i32)>,
+    extents: (i32, i32, i32, i32),
+}
+
+/// Bind an AT-SPI application toplevel to a KWin window. Titles are the strong
+/// signal (same rule as Hyprland); when KWin and the toolkit disagree on the
+/// caption — Firefox reports "Mozilla Firefox" while AT-SPI carries the page
+/// title — fall back to frame geometry, which is only accepted when the nearest
+/// frame wins by [`FRAME_MATCH_MARGIN_PX`].
+fn correlate_kwin_frame(
+    frames: &[KwinFrame],
+    windows: &[(&str, i32, i32, i32, i32)],
+    target: usize,
+) -> Option<usize> {
+    windows.get(target)?;
+    let title_backed: Vec<HyprlandFrame> = frames
+        .iter()
+        .map(|frame| HyprlandFrame {
+            ordinal: frame.ordinal,
+            title: frame.title.clone(),
+            browser_root: frame.browser_root,
+            size: frame.size,
+        })
+        .collect();
+    let clients: Vec<(&str, u32, u32)> = windows
+        .iter()
+        .map(|&(title, _, _, width, height)| (title, width as u32, height as u32))
+        .collect();
+    if let Some(ordinal) = correlate_hyprland_frame(&title_backed, &clients, target) {
+        return Some(ordinal);
+    }
+    let (_, window_x, window_y, window_width, window_height) = windows[target];
+    let mut scored: Vec<(u64, usize)> = frames
+        .iter()
+        .filter_map(|frame| {
+            let (x, y, width, height) = frame.extents;
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            let distance = (i64::from(x) - i64::from(window_x)).unsigned_abs()
+                + (i64::from(y) - i64::from(window_y)).unsigned_abs()
+                + (i64::from(width) - i64::from(window_width)).unsigned_abs()
+                + (i64::from(height) - i64::from(window_height)).unsigned_abs();
+            Some((distance, frame.ordinal))
+        })
+        .collect();
+    scored.sort_by_key(|(distance, ordinal)| (*distance, *ordinal));
+    let (best_distance, best_ordinal) = *scored.first()?;
+    if best_distance > FRAME_MATCH_TOLERANCE_PX {
+        return None;
+    }
+    if let Some((runner_up, _)) = scored.get(1) {
+        if runner_up.saturating_sub(best_distance) < FRAME_MATCH_MARGIN_PX {
+            return None;
+        }
+    }
+    Some(best_ordinal)
+}
+
+#[cfg(test)]
+mod kwin_frame_tests {
+    use super::*;
+
+    fn frame(ordinal: usize, title: &str, extents: (i32, i32, i32, i32)) -> KwinFrame {
+        KwinFrame {
+            ordinal,
+            title: title.into(),
+            browser_root: false,
+            size: None,
+            extents,
+        }
+    }
+
+    #[test]
+    fn exact_titles_win_over_geometry() {
+        let frames = [
+            frame(0, "Editor", (300, 300, 400, 400)),
+            frame(1, "Terminal", (0, 0, 400, 400)),
+        ];
+        let windows = [("Editor", 0, 0, 400, 400), ("Terminal", 0, 0, 400, 400)];
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 0), Some(0));
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 1), Some(1));
+    }
+
+    #[test]
+    fn geometry_fallback_resolves_mismatched_captions() {
+        let frames = [
+            frame(0, "Mozilla Firefox", (0, 0, 1414, 853)),
+            frame(1, "Mozilla Firefox", (500, 200, 900, 700)),
+        ];
+        let windows = [
+            ("Mozilla Firefox", 0, 0, 1414, 853),
+            ("Mozilla Firefox", 500, 200, 900, 700),
+        ];
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 0), Some(0));
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 1), Some(1));
+    }
+
+    #[test]
+    fn geometry_fallback_refuses_ambiguity_and_far_matches() {
+        let frames = [
+            frame(0, "Firefox", (0, 0, 800, 600)),
+            frame(1, "Firefox", (1, 0, 800, 600)),
+        ];
+        let windows = [("Firefox", 0, 0, 800, 600), ("Firefox", 0, 0, 800, 600)];
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 0), None);
+        let frames = [frame(0, "Far", (2000, 2000, 800, 600))];
+        let windows = [("Zero", 0, 0, 800, 600)];
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 0), None);
+    }
+}
+
 #[cfg(test)]
 mod hyprland_frame_tests {
     use super::*;
@@ -1228,6 +1345,70 @@ async fn resolve_window_frame(
             .map(|window| (window.title.as_str(), window.width, window.height))
             .collect::<Vec<_>>();
         return correlate_hyprland_frame(&frames, &clients, target);
+    }
+    if crate::wayland::is_wayland()
+        && !crate::wayland::hyprland::is_session()
+        && crate::wayland::kwin_helper::available()
+    {
+        if let Some(windows) = crate::wayland::kwin_helper::list_windows() {
+            let owned: Vec<_> = windows.iter().filter(|window| window.pid == pid).collect();
+            if let Some(target) = owned.iter().position(|window| window.token == xid) {
+                let chromium = std::fs::read_link(format!("/proc/{pid}/exe"))
+                    .ok()
+                    .and_then(|path| {
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                    })
+                    .is_some_and(|name| crate::browser_platform::is_chromium_identity(&name));
+                let mut frames = Vec::new();
+                for (ordinal, oref) in seeds.iter().enumerate() {
+                    let acc = call(accessible_for(conn, oref)).await?.ok()?;
+                    let role = call(acc.get_role_name()).await?.ok()?;
+                    if !matches!(
+                        role.as_str(),
+                        "frame" | "window" | "dialog" | "alert" | "file chooser"
+                    ) {
+                        continue;
+                    }
+                    let title = call(acc.name()).await?.ok()?;
+                    let browser_root = if chromium {
+                        call(acc.get_attributes())
+                            .await?
+                            .ok()?
+                            .get("class")
+                            .is_some_and(|class| class == "BrowserRootView")
+                    } else {
+                        false
+                    };
+                    let proxies = call(acc.proxies()).await?.ok()?;
+                    let component = call(proxies.component()).await?.ok()?;
+                    let (x, y, width, height) =
+                        call(component.get_extents(CoordType::Screen)).await?.ok()?;
+                    frames.push(KwinFrame {
+                        ordinal,
+                        title,
+                        browser_root,
+                        size: browser_root.then_some((width, height)),
+                        extents: (x, y, width, height),
+                    });
+                }
+                let clients = owned
+                    .iter()
+                    .map(|window| {
+                        (
+                            window.title.as_str(),
+                            window.x,
+                            window.y,
+                            window.width as i32,
+                            window.height as i32,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(ordinal) = correlate_kwin_frame(&frames, &clients, target) {
+                    return Some(ordinal);
+                }
+            }
+        }
     }
     if seeds.len() == 1 {
         // One top-level: the caller's window is the only thing this
@@ -3205,6 +3386,11 @@ fn is_checkbox_role(role: &str) -> bool {
 fn activation_index(role: &str, actions: &[String]) -> Option<usize> {
     actions.iter().position(|action| {
         is_activation_action(action)
+            // Qt/KDE menubar items expose only "Show Menu"; firing it is what a
+            // click on the menubar does and is the only way to reach their
+            // popup's items. Leaf items expose "Press" and stay on the normal
+            // activation path.
+            || (is_menu_role(role) && normalized_action_verb(action) == "showmenu")
             || (is_checkbox_role(role)
                 && CHECKBOX_ACTIVATION_VERBS.contains(&normalized_action_verb(action).as_str()))
     })
@@ -3326,6 +3512,18 @@ fn is_menu_role(role: &str) -> bool {
     role.trim().to_ascii_lowercase().contains("menu")
 }
 
+/// Actionable menu entries. A toolkit wraps a menubar's popup items in a
+/// labelled `popup menu` (Qt names it after the application), and a menu bar
+/// container may carry a label too; neither is a user-visible path segment, so
+/// only item roles and action-bearing `menu` entries count toward a path.
+fn is_menu_path_segment(role: &str, actions: &[String]) -> bool {
+    let role = role.trim().to_ascii_lowercase();
+    role == "menu item"
+        || role == "check menu item"
+        || role == "radio menu item"
+        || (role == "menu" && !actions.is_empty())
+}
+
 /// Find one exact visible menu lineage in a flattened pre-order AT-SPI walk.
 /// Unlabelled menu containers are transparent; all labelled menu ancestors
 /// must match the requested prefix, so duplicate labels elsewhere fail closed.
@@ -3361,7 +3559,9 @@ fn exact_menu_path_matches(visited: &[Visited<'_>], path: &[String]) -> Vec<usiz
             let mut cursor = Some(index);
             while let Some(current) = cursor {
                 let ancestor = &visited[current];
-                if is_menu_role(&ancestor.role) && !ancestor.name.trim().is_empty() {
+                if is_menu_path_segment(&ancestor.role, &ancestor.actions)
+                    && !ancestor.name.trim().is_empty()
+                {
                     lineage.push(ancestor.name.trim());
                 }
                 cursor = parents[current];
@@ -3385,17 +3585,217 @@ pub fn invoke_menu_path(pid: u32, path: &[String]) -> Result<()> {
 /// publishes every document window's menubar in one AT-SPI application),
 /// the hop under `xid`'s frame wins instead of the path being ambiguous.
 pub fn invoke_menu_path_in(pid: u32, xid: u64, path: &[String]) -> Result<()> {
-    bounded(
+    invoke_menu_path_inner(pid, xid, path, None, |_, _| Ok(()))
+}
+
+/// [`invoke_menu_path_in`] that opens the top-level menu with a real pointer
+/// click instead of the AT-SPI `Show Menu` action.
+///
+/// Kate (and other Qt/KDE apps) advertise `Show Menu` on the menubar item and
+/// return `true` from `doAction`, but no popup appears. A real click does open
+/// it, and the popup then exposes its items to the same AT-SPI walk, which can
+/// `Press` them. `client_origin` is the window's client-area origin in screen
+/// coordinates (see [`kwin_client_origin`]); it turns the item's client-local
+/// extents into the click point.
+pub fn invoke_menu_path_in_with_first_click<F>(
+    pid: u32,
+    xid: u64,
+    path: &[String],
+    client_origin: Option<(i32, i32)>,
+    first_click: F,
+) -> Result<()>
+where
+    F: Fn(i32, i32) -> Result<()>,
+{
+    invoke_menu_path_inner(pid, xid, path, client_origin, first_click)
+}
+
+struct DirectMenuTarget<'a> {
+    role: String,
+    enabled: Option<bool>,
+    actions: Vec<String>,
+    acc: AccessibleProxy<'a>,
+}
+
+/// Find the next menu path segment directly beneath an already-resolved menu
+/// item. The application-wide walk visits every menubar's popup (Kate alone is
+/// over a thousand nodes), so a deep submenu cannot finish inside the budget;
+/// the popup subtree itself is only a handful of nodes.
+async fn find_direct_menu_child<'a>(
+    conn: &'a AccessibilityConnection,
+    parent: &AccessibleProxy<'a>,
+    wanted: &str,
+) -> Result<Option<DirectMenuTarget<'a>>> {
+    let mut queue: Vec<(RawObjectRef, usize)> = match call(parent.get_children()).await {
+        Some(Ok(children)) => children
+            .iter()
+            .filter_map(RawObjectRef::from_atspi)
+            .map(|child| (child, 0))
+            .collect(),
+        _ => return Ok(None),
+    };
+    let wanted = wanted.trim();
+    let mut examined = 0usize;
+    while let Some((oref, depth)) = queue.pop() {
+        examined += 1;
+        if examined > 256 {
+            break;
+        }
+        let node = match call(accessible_for(conn, &oref)).await {
+            Some(Ok(node)) => node,
+            _ => continue,
+        };
+        let (role_r, name_r, state_r) = tokio::join!(
+            call(node.get_role_name()),
+            call(node.name()),
+            call(node.get_state()),
+        );
+        let role = role_r.and_then(Result::ok).unwrap_or_default();
+        let name = name_r.and_then(Result::ok).unwrap_or_default();
+        let enabled = state_r
+            .as_ref()
+            .and_then(|state| state.as_ref().ok())
+            .map(is_enabled_state);
+        let mut actions = Vec::new();
+        if is_menu_role(&role) {
+            if let Some(Ok(proxies)) = call(node.proxies()).await {
+                if let Some(Ok(action)) = call(proxies.action()).await {
+                    let n = call(action.n_actions())
+                        .await
+                        .and_then(|result| result.ok())
+                        .unwrap_or(0);
+                    for index in 0..n {
+                        actions.push(
+                            call(action.get_name(index))
+                                .await
+                                .and_then(|result| result.ok())
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+            }
+        }
+        if is_menu_path_segment(&role, &actions) && name.trim() == wanted {
+            return Ok(Some(DirectMenuTarget {
+                role,
+                enabled,
+                actions,
+                acc: node,
+            }));
+        }
+        // Popup containers are transparent; do not descend into sibling menu
+        // items, whose children belong to a different path branch.
+        let role_lower = role.to_ascii_lowercase();
+        if depth < 3
+            && matches!(role_lower.as_str(), "popup menu" | "menu" | "menu bar")
+            && !is_menu_path_segment(&role, &actions)
+        {
+            if let Some(Ok(children)) = call(node.get_children()).await {
+                queue.extend(
+                    children
+                        .iter()
+                        .filter_map(RawObjectRef::from_atspi)
+                        .map(|child| (child, depth + 1)),
+                );
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Invoke the remaining segments under an already-opened first menu.
+async fn invoke_menu_children_direct<'a>(
+    conn: &'a AccessibilityConnection,
+    root: &AccessibleProxy<'a>,
+    segments: &[String],
+) -> Result<()> {
+    let mut current: Option<AccessibleProxy<'a>> = None;
+    for (offset, segment) in segments.iter().enumerate() {
+        let parent = current.as_ref().unwrap_or(root);
+        let child = find_direct_menu_child(conn, parent, segment)
+            .await?
+            .ok_or_else(|| anyhow!("menu path segment {} was not found", offset + 1))?;
+        if child.enabled == Some(false) {
+            anyhow::bail!("menu path segment {} is disabled", offset + 1);
+        }
+        let chosen = activation_index(&child.role, &child.actions).ok_or_else(|| {
+            anyhow!("menu path segment {} has no safe activation action", offset + 1)
+        })?;
+        let accepted = {
+            let proxies = child
+                .acc
+                .proxies()
+                .await
+                .map_err(|error| anyhow!("interface proxies unavailable: {error}"))?;
+            let action = proxies
+                .action()
+                .await
+                .map_err(|error| anyhow!("Action unavailable: {error}"))?;
+            action
+                .do_action(chosen as i32)
+                .await
+                .map_err(|error| anyhow!("doAction failed: {error}"))?
+        };
+        if !accepted {
+            anyhow::bail!("menu path segment {} rejected its native action", offset + 1);
+        }
+        current = Some(child.acc);
+        if offset + 1 != segments.len() {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+    }
+    Ok(())
+}
+
+fn invoke_menu_path_inner<F>(
+    pid: u32,
+    xid: u64,
+    path: &[String],
+    client_origin: Option<(i32, i32)>,
+    first_click: F,
+) -> Result<()>
+where
+    F: Fn(i32, i32) -> Result<()>,
+{
+    // A closed-menu walk visits every item of every menubar (Kate alone is
+    // several hundred nodes), and each AT-SPI node costs a handful of
+    // round-trips. Resolve the open tree first: the menubar is always visible,
+    // and after the first click the popup is open too. Fall back to the
+    // closed-menu walk only for toolkits that never mark a programmatically
+    // opened popup SHOWING. The budget covers the second (slow) walk.
+    bounded_for(
+        Duration::from_secs(60),
         async {
             let conn = shared_connection().await?;
             for depth in 0..path.len() {
-                let collected = collect_visited_bounded_opts(conn, pid, xid, None, None, true)
+                let mut collected = collect_visited_bounded_opts(conn, pid, xid, None, None, false)
                     .await?
                     .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+                let mut matches = exact_menu_path_matches(&collected.visited, &path[..=depth]);
+                // A click opens the popup on the compositor immediately, but
+                // the toolkit can take a moment to publish its items as
+                // SHOWING over AT-SPI. Re-walk the open tree a few times before
+                // paying for the (much slower) closed-menu walk.
+                for _ in 0..3 {
+                    if !matches.is_empty() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    collected = collect_visited_bounded_opts(conn, pid, xid, None, None, false)
+                        .await?
+                        .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+                    matches = exact_menu_path_matches(&collected.visited, &path[..=depth]);
+                }
+                if matches.is_empty() {
+                    collected = collect_visited_bounded_opts(conn, pid, xid, None, None, true)
+                        .await?
+                        .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+                    matches = exact_menu_path_matches(&collected.visited, &path[..=depth]);
+                }
+                let scoped_frame = collected.scoped_frame;
                 let visited = collected.visited;
-                let mut matches = exact_menu_path_matches(&visited, &path[..=depth]);
                 if matches.len() > 1 {
-                    if let Some(scope) = collected.scoped_frame {
+                    if let Some(scope) = scoped_frame {
                         let scoped: Vec<usize> = matches
                             .iter()
                             .copied()
@@ -3418,6 +3818,41 @@ pub fn invoke_menu_path_in(pid: u32, xid: u64, path: &[String]) -> Result<()> {
                 if target.enabled == Some(false) {
                     anyhow::bail!("menu path segment {depth} is disabled");
                 }
+
+                // A menubar `Show Menu` action is a no-op on Qt/KDE. Click the
+                // first segment like a user would; the popup then behaves like
+                // any other open menu for the remaining hops.
+                if depth == 0 {
+                    if let Some((origin_x, origin_y)) = client_origin {
+                        let extents = match target.acc.proxies().await {
+                            Ok(proxies) => match proxies.component().await {
+                                Ok(component) => {
+                                    component.get_extents(CoordType::Screen).await.ok()
+                                }
+                                Err(_) => None,
+                            },
+                            Err(_) => None,
+                        };
+                        if let Some((x, y, width, height)) = extents {
+                            if width > 0 && height > 0 {
+                                let screen_x = origin_x + x + width / 2;
+                                let screen_y = origin_y + y + height / 2;
+                                first_click(screen_x, screen_y)?;
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                if path.len() > 1 {
+                                    return invoke_menu_children_direct(
+                                        conn,
+                                        &target.acc,
+                                        &path[1..],
+                                    )
+                                    .await;
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
                 let chosen = activation_index(&target.role, &target.actions).ok_or_else(|| {
                     anyhow!("menu path segment {depth} has no safe activation action")
                 })?;
@@ -3444,6 +3879,174 @@ pub fn invoke_menu_path_in(pid: u32, xid: u64, path: &[String]) -> Result<()> {
             Ok(())
         },
         || Err(anyhow!("invoke_menu timed out for pid {pid}")),
+    )
+}
+
+/// Client-area origin of KWin window `xid` in screen coordinates.
+///
+/// Wayland clients cannot know their global position, so AT-SPI reports their
+/// frame and element extents relative to the client area (typically x=0,y=0).
+/// The compositor knows the client geometry; derive the offset from the frame
+/// geometry and the AT-SPI frame's client size, then add it to element extents
+/// before clicking. An XWayland client that reports a non-zero origin already
+/// publishes screen coordinates and is returned unchanged.
+pub fn kwin_client_origin(pid: u32, xid: u64) -> Result<Option<(i32, i32)>> {
+    let windows = crate::wayland::kwin_helper::list_windows()
+        .ok_or_else(|| anyhow!("KWin window list unavailable"))?;
+    let owned: Vec<&crate::wayland::kwin_helper::KwinWindow> = windows
+        .iter()
+        .filter(|window| window.pid == pid)
+        .collect();
+    let target_index = owned
+        .iter()
+        .position(|window| window.token == xid)
+        .ok_or_else(|| anyhow!("KWin window {xid} does not belong to pid {pid}"))?;
+    let target_window = owned[target_index];
+    let chromium = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .is_some_and(|name| crate::browser_platform::is_chromium_identity(&name));
+
+    bounded_for(
+        Duration::from_secs(12),
+        async {
+            let conn = shared_connection().await?;
+            let ResolvedApp {
+                app,
+                children: probed,
+            } = match resolve_app_for_pid(conn, pid).await? {
+                Some(app) => app,
+                None => return Ok(None),
+            };
+            let seeds: Vec<RawObjectRef> = match probed {
+                Some(children) => children
+                    .iter()
+                    .filter_map(RawObjectRef::from_atspi)
+                    .collect(),
+                None => match call(app.get_children()).await {
+                    Some(Ok(children)) => children
+                        .iter()
+                        .filter_map(RawObjectRef::from_atspi)
+                        .collect(),
+                    _ => Vec::new(),
+                },
+            };
+            if seeds.is_empty() {
+                return Ok(None);
+            }
+            let mut frames = Vec::new();
+            for (ordinal, oref) in seeds.iter().enumerate() {
+                let acc = match call(accessible_for(conn, oref)).await {
+                    Some(Ok(acc)) => acc,
+                    _ => continue,
+                };
+                let role = call(acc.get_role_name())
+                    .await
+                    .and_then(|role| role.ok())
+                    .unwrap_or_default();
+                if !matches!(
+                    role.as_str(),
+                    "frame" | "window" | "dialog" | "alert" | "file chooser"
+                ) {
+                    continue;
+                }
+                let title = call(acc.name())
+                    .await
+                    .and_then(|name| name.ok())
+                    .unwrap_or_default();
+                let browser_root = if chromium {
+                    call(acc.get_attributes())
+                        .await
+                        .and_then(|attrs| attrs.ok())
+                        .and_then(|attrs| {
+                            attrs.get("class").map(|class| class == "BrowserRootView")
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let extents = match call(acc.proxies()).await {
+                    Some(Ok(proxies)) => match call(proxies.component()).await {
+                        Some(Ok(component)) => call(component.get_extents(CoordType::Screen))
+                            .await
+                            .and_then(|extents| extents.ok()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((x, y, width, height)) = extents {
+                    frames.push(KwinFrame {
+                        ordinal,
+                        title,
+                        browser_root,
+                        size: browser_root.then_some((width, height)),
+                        extents: (x, y, width, height),
+                    });
+                }
+            }
+            let clients: Vec<(&str, i32, i32, i32, i32)> = owned
+                .iter()
+                .map(|window| {
+                    (
+                        window.title.as_str(),
+                        window.x,
+                        window.y,
+                        window.width as i32,
+                        window.height as i32,
+                    )
+                })
+                .collect();
+            let ordinal = match correlate_kwin_frame(&frames, &clients, target_index) {
+                Some(ordinal) => ordinal,
+                None => {
+                    // Wayland clients report frame extents relative to their
+                    // own client area (0,0), so the screen-position term in
+                    // `correlate_kwin_frame` cannot match. Captions and client
+                    // sizes still identify the window; collapse whitespace
+                    // because Qt's accessible name often doubles a space.
+                    let normalize = |value: &str| {
+                        value.split_whitespace().collect::<Vec<_>>().join(" ")
+                    };
+                    let target_title = normalize(&target_window.title);
+                    let size_distance = |frame: &KwinFrame| {
+                        (frame.extents.2 - target_window.width as i32).unsigned_abs() as u64
+                            + (frame.extents.3 - target_window.height as i32).unsigned_abs() as u64
+                    };
+                    let mut candidates: Vec<&KwinFrame> = frames
+                        .iter()
+                        .filter(|frame| normalize(&frame.title) == target_title)
+                        .collect();
+                    if candidates.is_empty() {
+                        candidates = frames.iter().collect();
+                    }
+                    candidates.sort_by_key(|frame| size_distance(frame));
+                    match candidates.first() {
+                        Some(frame) if frames.len() == 1 || size_distance(frame) <= 160 => {
+                            frame.ordinal
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+            };
+            let frame = match frames.iter().find(|frame| frame.ordinal == ordinal) {
+                Some(frame) => frame,
+                None => return Ok(None),
+            };
+            let (frame_x, frame_y, frame_width, frame_height) = frame.extents;
+            if frame_width <= 0 || frame_height <= 0 {
+                return Ok(None);
+            }
+            if frame_x != 0 || frame_y != 0 {
+                return Ok(Some((frame_x, frame_y)));
+            }
+            let origin_x = target_window.x + (target_window.width as i32 - frame_width) / 2;
+            let origin_y = target_window.y + (target_window.height as i32 - frame_height);
+            Ok(Some((origin_x, origin_y)))
+        },
+        || Err(anyhow!("KWin client-origin lookup timed out")),
     )
 }
 
@@ -7712,5 +8315,44 @@ mod at_point_rules_tests {
             .describe()
             .starts_with("selected: canvas \"file.txt\""));
         assert!(selected.describe().contains("read back as selected"));
+    }
+}
+
+
+#[cfg(test)]
+mod menu_click_live_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs a live KWin window on the session bus"]
+    fn live_menu_open_click() {
+        let pid: u32 = std::env::var("CUA_TEST_PID")
+            .expect("CUA_TEST_PID")
+            .parse()
+            .unwrap();
+        let xid: u64 = std::env::var("CUA_TEST_XID")
+            .expect("CUA_TEST_XID")
+            .parse()
+            .unwrap();
+        let origin = kwin_client_origin(pid, xid)
+            .expect("origin lookup")
+            .expect("client origin");
+        eprintln!("client origin: {origin:?}");
+        crate::wayland::activate_window_for_input_target(xid, Some(pid))
+            .expect("activate target window");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let window = crate::wayland::kwin_helper::trusted_window_for_id(pid, xid)
+            .expect("trusted window");
+        invoke_menu_path_in_with_first_click(
+            pid,
+            xid,
+            &["File".to_string(), "New".to_string()],
+            Some(origin),
+            |x, y| {
+                eprintln!("menu open click at {x},{y}");
+                crate::wayland::kwin_helper::click_background(window.token, x, y, 1, 1)
+            },
+        )
+        .expect("menu invocation");
     }
 }

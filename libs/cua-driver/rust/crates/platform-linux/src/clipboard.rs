@@ -17,6 +17,64 @@ impl LinuxClipboard {
         }
     }
 
+    /// Snapshot native data formats without logging clipboard contents.
+    pub(crate) fn snapshot(&self) -> Result<Vec<clipboard_rs::common::ClipboardContent>, String> {
+        let context = self.context()?;
+        let formats = match context.available_formats() {
+            Ok(formats) => formats,
+            // clipboard-rs 0.3.5 erases wl-clipboard-rs's ClipboardEmpty
+            // variant into this string. An empty selection is a valid
+            // snapshot; preserve every other error before changing it.
+            Err(error) if error.to_string() == "The clipboard of the requested seat is empty" => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut contents = Vec::new();
+        for format in formats {
+            // X11 selection protocol targets are not clipboard payload formats.
+            if matches!(
+                format.as_str(),
+                "TARGETS"
+                    | "TIMESTAMP"
+                    | "MULTIPLE"
+                    | "SAVE_TARGETS"
+                    | "DELETE"
+                    | "INSERT_PROPERTY"
+                    | "INSERT_SELECTION"
+                    | "INCR"
+                    | "ATOM"
+                    | "ATOM_PAIR"
+                    | "INTEGER"
+                    | "LENGTH"
+                    | "LIST_LENGTH"
+                    | "CHARACTER_POSITION"
+                    | "LINE_NUMBER"
+                    | "COLUMN_NUMBER"
+                    | "SPAN"
+            ) {
+                continue;
+            }
+            let bytes = context
+                .get_buffer(&format)
+                .map_err(|error| error.to_string())?;
+            contents.push(clipboard_rs::common::ClipboardContent::Other(format, bytes));
+        }
+        Ok(contents)
+    }
+
+    pub(crate) fn restore(
+        &self,
+        contents: Vec<clipboard_rs::common::ClipboardContent>,
+    ) -> Result<(), String> {
+        let context = self.context()?;
+        if contents.is_empty() {
+            context.clear().map_err(|error| error.to_string())
+        } else {
+            context.set(contents).map_err(|error| error.to_string())
+        }
+    }
+
     fn context(&self) -> Result<std::sync::MutexGuard<'_, ClipboardContext>, String> {
         self.context
             .get_or_init(|| {

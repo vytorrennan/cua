@@ -96,6 +96,8 @@ pub enum ActionTransport {
     LinuxHyprlandIsolatedInput,
     LinuxHyprlandForegroundInput,
     LinuxX11ConfigureWindow,
+    /// Window geometry set through the in-process KWin effect.
+    LinuxKwinConfigureWindow,
     BrowserCdpInputMouse,
     BrowserCdpInputKey,
     BrowserCdpRuntimeFunction,
@@ -136,6 +138,7 @@ impl ActionTransport {
         Self::LinuxHyprlandIsolatedInput,
         Self::LinuxHyprlandForegroundInput,
         Self::LinuxX11ConfigureWindow,
+        Self::LinuxKwinConfigureWindow,
         Self::BrowserCdpInputMouse,
         Self::BrowserCdpInputKey,
         Self::BrowserCdpRuntimeFunction,
@@ -173,9 +176,10 @@ impl ActionTransport {
             | Self::LinuxWaylandVirtualPointer
             | Self::LinuxHyprlandForegroundInput
             | Self::LinuxCuaCompositorInject => ActionRoute::GlobalInput,
-            Self::WindowsSetWindowPos | Self::LinuxX11ConfigureWindow | Self::MacosAppleEvent => {
-                ActionRoute::SystemApi
-            }
+            Self::WindowsSetWindowPos
+            | Self::LinuxX11ConfigureWindow
+            | Self::LinuxKwinConfigureWindow
+            | Self::MacosAppleEvent => ActionRoute::SystemApi,
             Self::BrowserCdpRuntimeFunction => ActionRoute::Dom,
             Self::BrowserCdpInputMouse | Self::BrowserCdpInputKey => ActionRoute::TrustedInput,
         }
@@ -1146,6 +1150,7 @@ fn transport_name(transport: ActionTransport) -> &'static str {
         ActionTransport::LinuxHyprlandIsolatedInput => "linux_hyprland_isolated_input",
         ActionTransport::LinuxHyprlandForegroundInput => "linux_hyprland_foreground_input",
         ActionTransport::LinuxX11ConfigureWindow => "linux_x11_configure_window",
+        ActionTransport::LinuxKwinConfigureWindow => "linux_kwin_configure_window",
         ActionTransport::BrowserCdpInputMouse => "browser_cdp_input_mouse",
         ActionTransport::BrowserCdpInputKey => "browser_cdp_input_key",
         ActionTransport::BrowserCdpRuntimeFunction => "browser_cdp_runtime_function",
