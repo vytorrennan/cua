@@ -24,6 +24,7 @@ mod primary_seat;
 pub mod shell_helper;
 pub mod sway_ipc;
 mod virtual_keyboard;
+pub(crate) mod window_relations;
 // RemoteDesktop/libei input is portable and ships in release binaries.
 // PipeWire ScreenCast capture remains separately gated for modern/Nix builds.
 #[cfg(feature = "portal-input")]
@@ -242,6 +243,7 @@ struct Toplevel {
     app_id: String,
     closed: bool,
     activated: bool,
+    parent: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -651,6 +653,9 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
                 tl.activated = foreign_toplevel_state_is_activated(&state)
             }
             ftl_handle::Event::Closed => tl.closed = true,
+            ftl_handle::Event::Parent { parent } => {
+                tl.parent = parent.map(|p| p.id().protocol_id())
+            }
             _ => {}
         }
     }
@@ -688,6 +693,7 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
     let sway_windows = sway_ipc::list_windows().unwrap_or_default();
     let mut used_sway_ids = HashSet::new();
     let mut out = Vec::new();
+    let mut relation_ids = HashMap::new();
     for (id, tl) in &state.toplevels {
         if tl.closed {
             continue;
@@ -712,11 +718,36 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
                 })
             });
         let stable_id = sway.map(|window| window.id).unwrap_or(*id as u64);
+        // Existing Sway enrichment can choose between duplicate captions.
+        // Such a join is insufficient evidence for native parent metadata.
+        let unique_join = sway.is_some_and(|selected| {
+            let matches = |title: &str, app_id: &str| {
+                !tl.title.is_empty() && title == tl.title && app_id == tl.app_id
+            };
+            matches(&selected.title, &selected.app_id)
+                && sway_windows
+                    .iter()
+                    .filter(|w| matches(&w.title, &w.app_id))
+                    .count()
+                    == 1
+                && state
+                    .toplevels
+                    .values()
+                    .filter(|t| !t.closed && matches(&t.title, &t.app_id))
+                    .count()
+                    == 1
+        });
+        if sway_windows.is_empty() || unique_join {
+            relation_ids.insert(*id, stable_id);
+        }
         if let Some(window) = sway {
             used_sway_ids.insert(window.id);
         }
         remember_identity(stable_id, tl);
         out.push(WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid: stable_id,
             pid: sway.map(|window| window.pid),
             app_name: tl.app_id.clone(),
@@ -728,6 +759,17 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
             width: sway.map(|window| window.width).unwrap_or(0),
             height: sway.map(|window| window.height).unwrap_or(0),
         });
+    }
+    // Resolve parent handles in this same protocol snapshot. Child-before-
+    // parent event order and closed handles must not create guessed IDs.
+    for window in &mut out {
+        if let Some((protocol_id, _)) = relation_ids.iter().find(|(_, id)| **id == window.xid) {
+            window.transient_for = state
+                .toplevels
+                .get(protocol_id)
+                .and_then(|t| t.parent)
+                .and_then(|parent| relation_ids.get(&parent).copied());
+        }
     }
     Ok(out)
 }
@@ -1493,9 +1535,8 @@ pub(crate) fn compositor_logical_frame() -> Option<anyhow::Result<(u32, u32)>> {
     }
     if kwin_helper::available() {
         return Some((|| {
-            let geometry = kwin_helper::screen_geometry().ok_or_else(|| {
-                anyhow::anyhow!("KWin screen geometry is unavailable")
-            })?;
+            let geometry = kwin_helper::screen_geometry()
+                .ok_or_else(|| anyhow::anyhow!("KWin screen geometry is unavailable"))?;
             let width = geometry
                 .get("width")
                 .and_then(serde_json::Value::as_u64)
@@ -2617,8 +2658,9 @@ fn kwin_hotkey(token: u64, keys: &[String]) -> anyhow::Result<()> {
             other => anyhow::bail!("no evdev keycode mapping for modifier '{other}'"),
         });
     }
-    let keycode = key_to_evdev(&final_key)
-        .ok_or_else(|| anyhow::anyhow!("no evdev keycode mapping for key '{final_key}' (KWin path)"))?;
+    let keycode = key_to_evdev(&final_key).ok_or_else(|| {
+        anyhow::anyhow!("no evdev keycode mapping for key '{final_key}' (KWin path)")
+    })?;
     let mut transitions = Vec::with_capacity(codes.len() * 2 + 2);
     transitions.extend(codes.iter().map(|code| (*code, true)));
     transitions.push((keycode, true));
@@ -2754,9 +2796,8 @@ fn kwin_clipboard_paste(pid: u32, token: u64, text: &str, terminal: bool) -> any
 
 /// Press a named key in one exact KWin window without activating it.
 pub fn kwin_press_key_background(token: u64, key: &str) -> anyhow::Result<()> {
-    let keycode = key_to_evdev(key).ok_or_else(|| {
-        anyhow::anyhow!("no evdev keycode mapping for key '{key}' (KWin path)")
-    })?;
+    let keycode = key_to_evdev(key)
+        .ok_or_else(|| anyhow::anyhow!("no evdev keycode mapping for key '{key}' (KWin path)"))?;
     kwin_helper::press_key_background(token, keycode)
 }
 
@@ -2773,8 +2814,9 @@ pub fn kwin_hotkey_background(token: u64, keys: &[String]) -> anyhow::Result<()>
             other => anyhow::bail!("no evdev keycode mapping for modifier '{other}'"),
         });
     }
-    let keycode = key_to_evdev(&final_key)
-        .ok_or_else(|| anyhow::anyhow!("no evdev keycode mapping for key '{final_key}' (KWin path)"))?;
+    let keycode = key_to_evdev(&final_key).ok_or_else(|| {
+        anyhow::anyhow!("no evdev keycode mapping for key '{final_key}' (KWin path)")
+    })?;
     let mut transitions = Vec::with_capacity(codes.len() * 2 + 2);
     transitions.extend(codes.iter().map(|code| (*code, true)));
     transitions.push((keycode, true));
@@ -3875,6 +3917,9 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
                     windows
                         .into_iter()
                         .map(|w| WindowInfo {
+                            transient_for: None,
+                            modal: None,
+                            window_type: None,
                             xid: w.address,
                             pid: Some(w.pid),
                             app_name: w.app_id,
@@ -4041,6 +4086,7 @@ fn enrich_native_windows(
                 app_id: window.app_name.clone(),
                 closed: false,
                 activated: false,
+                parent: None,
             };
             window.xid = candidate.xid;
             remember_identity(window.xid, &toplevel);
@@ -4252,6 +4298,9 @@ mod tests {
 
     fn window(xid: u64, pid: Option<u32>, title: &str) -> WindowInfo {
         WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid,
             pid,
             app_name: String::new(),
@@ -4465,6 +4514,9 @@ mod tests {
         assert!(!window_was_listed_for_pid(pid, window_id));
 
         remember_listed_windows(&[WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid: window_id,
             pid: Some(pid),
             app_name: String::new(),

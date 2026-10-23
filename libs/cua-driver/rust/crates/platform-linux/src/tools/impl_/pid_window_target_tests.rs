@@ -3,6 +3,9 @@ use cua_driver_core::window_target::{resolve_pid_window_target, PidWindowTargetR
 
 fn window(xid: u64, pid: u32) -> crate::x11::WindowInfo {
     crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         xid,
         pid: Some(pid),
         app_name: "editor".into(),

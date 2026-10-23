@@ -28,6 +28,9 @@ fn synthetic_pointer_drop_detection_covers_gtk_vcl_and_qt() {
 #[test]
 fn desktop_window_lines_expose_pid_and_window_id() {
     let windows = vec![crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         xid: 0x2e00003,
         pid: Some(4321),
         app_name: "libreoffice".into(),

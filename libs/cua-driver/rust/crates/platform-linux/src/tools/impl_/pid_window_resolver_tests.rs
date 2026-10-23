@@ -2,6 +2,9 @@ use super::*;
 
 fn win(xid: u64, z: Option<usize>, on_screen: bool, w: u32, h: u32) -> crate::x11::WindowInfo {
     crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         xid,
         pid: Some(7),
         app_name: "gimp".into(),
@@ -20,10 +23,16 @@ fn point_resolver_prefers_the_topmost_window_by_stacking_position() {
     // Main window listed last (as `_NET_CLIENT_LIST_STACKING` bottom-up
     // enumeration does when a dialog sits above it); the dialog wins.
     let dialog = crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         z_index: Some(5),
         ..win(2, None, true, 400, 300)
     };
     let main = crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         z_index: Some(3),
         ..win(1, None, true, 1920, 1080)
     };

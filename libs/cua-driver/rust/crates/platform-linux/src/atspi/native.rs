@@ -1245,6 +1245,56 @@ mod kwin_frame_tests {
 }
 
 #[cfg(test)]
+mod kwin_popup_tests {
+    use super::*;
+    fn frame(ordinal: usize, w: i32, h: i32) -> KwinFrame {
+        KwinFrame {
+            ordinal,
+            title: String::new(),
+            browser_root: false,
+            size: None,
+            extents: (570, 160, w, h),
+        }
+    }
+    #[test]
+    fn popup_bounds_remove_parent_local_origin_before_using_native_popup_origin() {
+        let delta = popup_window_offset((1211, 489), Some((571, 160)));
+        assert_eq!((585 + delta.0, 174 + delta.1), (1225, 503));
+        assert_eq!(popup_window_offset((1211, 489), Some((0, 0))), (1211, 489));
+    }
+    #[test]
+    fn popup_uses_own_accessible_root_with_tight_size_match() {
+        assert_eq!(
+            correlate_kwin_popup(&[frame(9, 204, 110)], &[("", 1200, 400, 204, 110)], 0),
+            Some(9)
+        );
+        assert_eq!(
+            correlate_kwin_popup(&[frame(1, 640, 420)], &[("", 1200, 400, 204, 110)], 0),
+            None
+        );
+    }
+    #[test]
+    fn popup_refuses_ambiguous_native_or_accessible_roots() {
+        assert_eq!(
+            correlate_kwin_popup(
+                &[frame(1, 204, 110), frame(2, 204, 110)],
+                &[("", 0, 0, 204, 110)],
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            correlate_kwin_popup(
+                &[frame(1, 204, 110)],
+                &[("", 0, 0, 204, 110), ("", 800, 0, 204, 110)],
+                0
+            ),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
 mod hyprland_frame_tests {
     use super::*;
 
@@ -1355,6 +1405,104 @@ async fn active_kwin_frames(
     Some(active)
 }
 
+fn popup_role(role: &str) -> bool {
+    matches!(
+        role,
+        "popup menu" | "menu" | "tool tip" | "tooltip" | "list"
+    )
+}
+
+/// Toolkits may publish a popup under a menubar rather than under the
+/// application. Add those actual accessible objects as independent roots.
+/// Keep this bounded and restricted to a compositor-attested popup request.
+async fn append_kwin_popup_seeds(
+    conn: &AccessibilityConnection,
+    pid: u32,
+    token: u64,
+    seeds: &mut Vec<RawObjectRef>,
+) {
+    let Some(windows) = crate::wayland::kwin_helper::list_windows() else {
+        return;
+    };
+    let Some(mut parent) = windows.iter().find(|w| w.pid == pid && w.token == token) else {
+        return;
+    };
+    if !matches!(parent.window_type.as_deref(), Some("popup" | "tooltip")) {
+        return;
+    }
+    let mut ancestors = std::collections::HashSet::new();
+    while matches!(parent.window_type.as_deref(), Some("popup" | "tooltip")) {
+        if !ancestors.insert(parent.token) {
+            return;
+        }
+        let Some(next) = parent
+            .transient_for
+            .and_then(|id| windows.iter().find(|w| w.token == id && w.pid == pid))
+        else {
+            return;
+        };
+        parent = next;
+    }
+    // Parent identity is proved without changing focus while a popup is open.
+    let Some(ordinal) = resolve_kwin_frame(conn, pid, parent.token, seeds).await else {
+        return;
+    };
+    let mut queue = std::collections::VecDeque::from([(seeds[ordinal].clone(), 0usize)]);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..256 {
+        let Some((oref, depth)) = queue.pop_front() else {
+            break;
+        };
+        if deadline_passed() || !seen.insert((oref.name.clone(), oref.path.clone())) {
+            continue;
+        }
+        let Some(Ok(acc)) = call(accessible_for(conn, &oref)).await else {
+            continue;
+        };
+        let Some(Ok(role)) = call(acc.get_role_name()).await else {
+            continue;
+        };
+        let Some(Ok(state)) = call(acc.get_state()).await else {
+            continue;
+        };
+        if state.contains(State::Defunct) {
+            continue;
+        }
+        if popup_role(&role) && state.contains(State::Showing) && !seeds.contains(&oref) {
+            seeds.push(oref.clone());
+        }
+        // Web documents cannot own native desktop menus. Avoid walking a
+        // whole page to find a browser-chrome popup.
+        if depth < 12 && !matches!(role.as_str(), "document web" | "document frame") {
+            if let Some(Ok(children)) = call(raw_children(conn.connection(), &oref)).await {
+                queue.extend(children.into_iter().map(|child| (child, depth + 1)));
+            }
+        }
+    }
+}
+
+fn correlate_kwin_popup(
+    frames: &[KwinFrame],
+    windows: &[(&str, i32, i32, i32, i32)],
+    target: usize,
+) -> Option<usize> {
+    let &(_, _, _, width, height) = windows.get(target)?;
+    let same_size = |w: i32, h: i32| {
+        width > 0
+            && height > 0
+            && (i64::from(w) - i64::from(width)).abs() <= 4
+            && (i64::from(h) - i64::from(height)).abs() <= 4
+    };
+    let mut candidates = frames
+        .iter()
+        .filter(|f| same_size(f.extents.2, f.extents.3));
+    let frame = candidates.next()?;
+    if candidates.next().is_some() || windows.iter().filter(|w| same_size(w.3, w.4)).count() != 1 {
+        return None;
+    }
+    Some(frame.ordinal)
+}
+
 async fn resolve_kwin_frame(
     conn: &AccessibilityConnection,
     pid: u32,
@@ -1366,6 +1514,10 @@ async fn resolve_kwin_frame(
     let owned: Vec<_> = windows.iter().filter(|window| window.pid == pid).collect();
     let target = owned.iter().position(|window| window.token == token)?;
     let handle = &owned[target].handle;
+    let popup = matches!(
+        owned[target].window_type.as_deref(),
+        Some("popup" | "tooltip")
+    );
     let objects: Vec<_> = seeds
         .iter()
         .map(|r| (r.name.clone(), r.path.clone()))
@@ -1394,14 +1546,18 @@ async fn resolve_kwin_frame(
     for (ordinal, oref) in seeds.iter().enumerate() {
         let acc = call(accessible_for(conn, oref)).await?.ok()?;
         let role = call(acc.get_role_name()).await?.ok()?;
-        if !matches!(
-            role.as_str(),
-            "frame" | "window" | "dialog" | "alert" | "file chooser"
-        ) {
+        if if popup {
+            !popup_role(&role)
+        } else {
+            !matches!(
+                role.as_str(),
+                "frame" | "window" | "dialog" | "alert" | "file chooser"
+            )
+        } {
             continue;
         }
         let state = call(acc.get_state()).await?.ok()?;
-        if state.contains(State::Defunct) {
+        if state.contains(State::Defunct) || (popup && !state.contains(State::Showing)) {
             continue;
         }
         let title = call(acc.name()).await?.ok()?;
@@ -1439,13 +1595,32 @@ async fn resolve_kwin_frame(
         .iter()
         .map(|w| (w.title.as_str(), w.x, w.y, w.width as i32, w.height as i32))
         .collect();
+    if popup {
+        // Popups cannot take keyboard focus. Do not bind the parent's frame
+        // or borrow focus, which would dismiss the popup grab.
+        let popup_clients: Vec<_> = owned
+            .iter()
+            .filter(|w| matches!(w.window_type.as_deref(), Some("popup" | "tooltip")))
+            .map(|w| (w.title.as_str(), w.x, w.y, w.width as i32, w.height as i32))
+            .collect();
+        let popup_target = owned
+            .iter()
+            .filter(|w| matches!(w.window_type.as_deref(), Some("popup" | "tooltip")))
+            .position(|w| w.token == token)?;
+        return correlate_kwin_popup(&frames, &popup_clients, popup_target)
+            .and_then(|ordinal| remember(ordinal, handle));
+    }
     if let Some(ordinal) = correlate_kwin_frame(&frames, &clients, target) {
         return remember(ordinal, handle);
     }
 
     // Only an unresolved first observation borrows focus. Cache hits above
     // survive title/size/focus changes without moving focus again.
-    if remaining_budget() < Duration::from_millis(500) {
+    if windows
+        .iter()
+        .any(|w| matches!(w.window_type.as_deref(), Some("popup" | "tooltip")))
+        || remaining_budget() < Duration::from_millis(500)
+    {
         return None;
     }
     let probe = AccessibilityProbe::begin(pid, token)?;
@@ -1677,7 +1852,7 @@ async fn collect_visited_bounded_opts<'a>(
     // chrome. `frame_ordinal` is the seed's position in `get_children()` order
     // and is likewise inherited, so every node carries the identity of the
     // top-level window it belongs to.
-    let (seeds, app_answered): (Vec<RawObjectRef>, bool) = match probed {
+    let (mut seeds, app_answered): (Vec<RawObjectRef>, bool) = match probed {
         Some(children) => (
             children
                 .iter()
@@ -1711,6 +1886,10 @@ async fn collect_visited_bounded_opts<'a>(
                 pending: 0,
             }),
         }));
+    }
+
+    if crate::wayland::is_wayland() && crate::wayland::kwin_helper::available() {
+        append_kwin_popup_seeds(conn, pid, xid, &mut seeds).await;
     }
 
     // Resolve which seed is the caller's window before walking, from the same
@@ -2979,6 +3158,9 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                     let xid = (((cpid as u64) << 16) | (i as u64)).max(1);
                     let z_index = z_index_from_stacking(&stacking, cpid, &title);
                     out.push(WindowInfo {
+                        transient_for: None,
+                        modal: None,
+                        window_type: None,
                         xid,
                         pid: Some(cpid),
                         app_name: app_name.clone(),
@@ -2996,6 +3178,9 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                 // the by-pid AT-SPI element flow stays reachable.
                 if emitted == 0 {
                     out.push(WindowInfo {
+                        transient_for: None,
+                        modal: None,
+                        window_type: None,
                         xid: (cpid as u64).max(1),
                         pid: Some(cpid),
                         app_name: app_name.clone(),
@@ -3859,7 +4044,10 @@ async fn invoke_menu_children_direct<'a>(
             anyhow::bail!("menu path segment {} is disabled", offset + 1);
         }
         let chosen = activation_index(&child.role, &child.actions).ok_or_else(|| {
-            anyhow!("menu path segment {} has no safe activation action", offset + 1)
+            anyhow!(
+                "menu path segment {} has no safe activation action",
+                offset + 1
+            )
         })?;
         let accepted = {
             let proxies = child
@@ -3877,7 +4065,10 @@ async fn invoke_menu_children_direct<'a>(
                 .map_err(|error| anyhow!("doAction failed: {error}"))?
         };
         if !accepted {
-            anyhow::bail!("menu path segment {} rejected its native action", offset + 1);
+            anyhow::bail!(
+                "menu path segment {} rejected its native action",
+                offset + 1
+            );
         }
         current = Some(child.acc);
         if offset + 1 != segments.len() {
@@ -4051,7 +4242,7 @@ pub fn kwin_client_origin(pid: u32, xid: u64) -> Result<Option<(i32, i32)>> {
                 Some(app) => app,
                 None => return Ok(None),
             };
-            let seeds: Vec<RawObjectRef> = match probed {
+            let mut seeds: Vec<RawObjectRef> = match probed {
                 Some(children) => children
                     .iter()
                     .filter_map(RawObjectRef::from_atspi)
@@ -4064,6 +4255,7 @@ pub fn kwin_client_origin(pid: u32, xid: u64) -> Result<Option<(i32, i32)>> {
                     _ => Vec::new(),
                 },
             };
+            append_kwin_popup_seeds(conn, pid, xid, &mut seeds).await;
             if seeds.is_empty() {
                 return Ok(None);
             }
@@ -4554,13 +4746,16 @@ pub fn perform_action_at_point_in(
             let Some(app) = app_for_pid(conn, pid).await? else {
                 return Ok(None);
             };
-            let seeds: Vec<RawObjectRef> = match call(app.get_children()).await {
+            let mut seeds: Vec<RawObjectRef> = match call(app.get_children()).await {
                 Some(Ok(children)) => children
                     .into_iter()
                     .filter_map(|child| RawObjectRef::from_atspi(&child))
                     .collect(),
                 _ => Vec::new(),
             };
+            if crate::wayland::is_wayland() && crate::wayland::kwin_helper::available() {
+                append_kwin_popup_seeds(conn, pid, xid, &mut seeds).await;
+            }
             let scoped = if xid == 0 {
                 None
             } else {
@@ -6866,6 +7061,13 @@ fn rebase_renderer_window_offset(
     offset
 }
 
+/// Qt popup extents can retain the parent's local origin. Normalize that
+/// root before adding the popup's own compositor-attested origin.
+fn popup_window_offset(origin: (i32, i32), frame: Option<(i32, i32)>) -> (i32, i32) {
+    let (x, y) = frame.unwrap_or((0, 0));
+    (origin.0.saturating_sub(x), origin.1.saturating_sub(y))
+}
+
 fn project_screen_extents(
     (x, y, w, h): (i32, i32, i32, i32),
     (offset_x, offset_y): (i32, i32),
@@ -6922,6 +7124,10 @@ async fn element_bounds_for_visited(
     // distinct per-widget WINDOW coords instead. On Wayland / when no X11
     // window resolves, `offset` is None and we keep the legacy Screen path
     // so non-X11 behaviour is unchanged.
+    let kwin_popup = scoped_frame.is_some()
+        && visited.first().is_some_and(|node| popup_role(&node.role))
+        && crate::wayland::is_wayland()
+        && crate::wayland::kwin_helper::available();
     let window_title = visited.iter().find_map(|node| {
         (scoped_frame.is_none_or(|scope| node.frame_ordinal == scope)
             && matches!(
@@ -6935,12 +7141,18 @@ async fn element_bounds_for_visited(
     // un-timed blocking round-trip; still route both through `bounded_blocking`
     // so this single call site can't stall the walk past its budget (#42).
     let window_title_owned = window_title.map(str::to_owned);
-    let offset =
-        bounded_blocking(move || window_to_screen_offset(pid, xid, window_title_owned.as_deref()))
-            .await
-            .flatten();
-    if crate::wayland::is_wayland()
-        && crate::wayland::hyprland::is_session()
+    let offset = bounded_blocking(move || {
+        if kwin_popup {
+            // A per-process origin can name the parent or another popup.
+            // Only this native token may position this popup's controls.
+            return crate::wayland::kwin_helper::trusted_window_for_id(pid, xid)
+                .map(|window| (window.x, window.y));
+        }
+        window_to_screen_offset(pid, xid, window_title_owned.as_deref())
+    })
+    .await
+    .flatten();
+    if (kwin_popup || (crate::wayland::is_wayland() && crate::wayland::hyprland::is_session()))
         && (offset.is_none() || scoped_frame.is_none())
     {
         return (Vec::new(), true);
@@ -7007,10 +7219,11 @@ async fn element_bounds_for_visited(
         let frame = visited.iter().find(|node| {
             scoped_frame.is_none_or(|scope| node.frame_ordinal == scope)
                 && node.has_component
-                && matches!(
-                    node.role.to_ascii_lowercase().as_str(),
-                    "frame" | "window" | "dialog" | "alert" | "file chooser"
-                )
+                && ((kwin_popup && popup_role(&node.role))
+                    || matches!(
+                        node.role.to_ascii_lowercase().as_str(),
+                        "frame" | "window" | "dialog" | "alert" | "file chooser"
+                    ))
         });
         if let Some(frame) = frame {
             match call(frame.acc.proxies()).await {
@@ -7039,10 +7252,12 @@ async fn element_bounds_for_visited(
     } else {
         None
     };
-    let (offset_x, offset_y) = rebase_renderer_window_offset(
-        offset.or(screen_rebase).unwrap_or((0, 0)),
-        window_frame_origin,
-    );
+    let base_offset = offset.or(screen_rebase).unwrap_or((0, 0));
+    let (offset_x, offset_y) = if kwin_popup {
+        popup_window_offset(base_offset, window_frame_origin)
+    } else {
+        rebase_renderer_window_offset(base_offset, window_frame_origin)
+    };
     if let Some((ox, oy)) = offset {
         dlog!("element bounds: WINDOW coords + screen offset ({ox},{oy})");
     } else if let Some((ox, oy)) = screen_rebase {
@@ -7060,9 +7275,10 @@ async fn element_bounds_for_visited(
     // Bounds are independent read-only queries. Overlap a bounded number of
     // calls instead of serializing thousands of unrealized menu components.
     // Preserve original indices, all extents checks, and per-call timeouts.
-    let origin_attested = bounded_blocking(move || native_wayland_origin_attested(pid, xid))
-        .await
-        .unwrap_or(false);
+    let origin_attested = kwin_popup
+        || bounded_blocking(move || native_wayland_origin_attested(pid, xid))
+            .await
+            .unwrap_or(false);
     let queries = scoped_component_nodes(&action_nodes, scoped_frame, |node| {
         (node.frame_ordinal, node.has_component)
     })
@@ -7269,6 +7485,9 @@ mod stacking_z_index_tests {
 
     fn window(pid: u32, title: &str, z: usize) -> WindowInfo {
         WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid: 100 + z as u64,
             pid: Some(pid),
             app_name: "app".into(),
@@ -7313,6 +7532,9 @@ mod frame_correlation_tests {
 
     fn window(x: i32, y: i32, width: u32, height: u32) -> WindowInfo {
         WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid: 4242,
             pid: Some(99),
             app_name: "Google-chrome".to_owned(),
@@ -8358,7 +8580,6 @@ mod at_point_rules_tests {
     }
 }
 
-
 #[cfg(test)]
 mod menu_click_live_tests {
     use super::*;
@@ -8381,8 +8602,8 @@ mod menu_click_live_tests {
         crate::wayland::activate_window_for_input_target(xid, Some(pid))
             .expect("activate target window");
         std::thread::sleep(std::time::Duration::from_millis(300));
-        let window = crate::wayland::kwin_helper::trusted_window_for_id(pid, xid)
-            .expect("trusted window");
+        let window =
+            crate::wayland::kwin_helper::trusted_window_for_id(pid, xid).expect("trusted window");
         invoke_menu_path_in_with_first_click(
             pid,
             xid,

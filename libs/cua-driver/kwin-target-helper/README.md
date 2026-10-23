@@ -5,8 +5,8 @@ the portable `cua-driver` binary and must be built against the user's installed
 KWin/Qt/KF6 development files. Do not use a helper built for a different KWin
 or Qt ABI.
 
-This fork adds protocol-v3 input and protocol-v4 accessibility identity methods
-alongside trusted window metadata.
+This fork adds protocol-v3 input, protocol-v4 accessibility identity methods,
+and protocol-v5 dialog and popup metadata.
 The helper resolves opaque window tokens inside KWin, validates callers and
 targets, and delivers input through the compositor. The driver verifies that
 the D-Bus service belongs to the current user's KWin process and binds the
@@ -109,9 +109,40 @@ characters retain physical key semantics. Background scrolling acknowledges
 after pointer/focus/stack restoration, preserving sequential batch ordering.
 
 Window and workspace captures use KWin ScreenShot2, including direct RGBX8888
-decoding. Window captures exclude separate popup and tooltip windows; use a
-desktop capture for those. Drag requests run sequentially because the
-compositor has one synthetic pointer.
+decoding. A parent window's capture contains its own buffer. Protocol v5 also
+lists separate user-owned popup and tooltip windows with their own tokens,
+UUIDs, geometry, native `transient_for`, `modal`, and `window_type`. Shell
+panels, notifications, and driver overlays remain excluded. The shared Linux
+responses preserve these fields and list native descendants in `dialogs` and
+`popups`, including children owned by another process. Follow-up calls name
+that child's PID. Same-PID siblings and overlapping unrelated windows do not
+imply ownership.
+
+Call `get_window_state` with the popup's own PID and window ID for its complete
+image, including pixels outside the parent. The response publishes a separate
+capture ID for coordinate actions. Popup reads do not activate the popup or
+borrow focus, and single clicks validate its actual pointer target without raising it.
+Multiple-click popup requests are refused before input, since the first click
+can close the menu. Toplevel-only input and geometry methods do not accept
+popup tokens.
+When Qt publishes a menu below a menu bar, the adapter searches the proved
+parent's accessibility subtree and treats the showing menu as its own root.
+Popup dimensions must match tightly and uniquely in both directions. Ambiguous
+or absent accessible roots still withhold unrelated rows; the popup's image
+and capture-bound coordinate actions remain available. Applications that do
+not export a context menu through AT-SPI cannot supply element tokens for it.
+Drag requests run sequentially because the compositor has one synthetic pointer.
+
+The shared metadata plumbing also preserves Mutter's native parent, modal and
+window-type fields in bundled GNOME helper API 11, and the wlroots foreign
+toplevel protocol's v3 parent event. This does not make every compositor expose
+popup handles. GNOME only reports windows represented by Mutter window actors;
+wlroots foreign-toplevel and ext-foreign-toplevel enumerate toplevels rather
+than arbitrary popup surfaces. Hyprland's current clients IPC path has no
+native parent metadata in this adapter. Missing provider fields remain absent,
+and no parent is guessed from titles, PID or overlap. Sway-enriched parent IDs
+require a unique title/app identity join. Those other sessions need their own
+native runtime verification.
 
 ## Verification and limits
 

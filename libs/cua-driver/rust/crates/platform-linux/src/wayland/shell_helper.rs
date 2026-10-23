@@ -543,6 +543,15 @@ fn parse_shell_windows(raw: &str, filter_pid: Option<u32>) -> Option<Vec<ShellWi
 
                 Some(ShellWindow {
                     info: WindowInfo {
+                        transient_for: window
+                            .get("transient_for")
+                            .and_then(serde_json::Value::as_u64)
+                            .filter(|id| *id != 0),
+                        modal: window.get("modal").and_then(serde_json::Value::as_bool),
+                        window_type: window
+                            .get("window_type")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
                         xid: id,
                         pid: Some(pid),
                         app_name: title.clone(),
@@ -712,7 +721,7 @@ mod tests {
     #[test]
     fn bundled_helper_uses_host_owned_modifier_badge_chips() {
         assert!(EXTENSION_SOURCE.contains("GetVersion()"));
-        assert!(EXTENSION_SOURCE.contains("return 10;"));
+        assert!(EXTENSION_SOURCE.contains("return 11;"));
         assert!(EXTENSION_SOURCE.contains("SetCursorState"));
         assert!(EXTENSION_SOURCE.contains("SetCursorColor"));
         assert!(EXTENSION_SOURCE.contains("SetSessionLabel"));
@@ -737,7 +746,7 @@ mod tests {
         assert!(!EXTENSION_SOURCE.contains("function drawModifiers"));
         let metadata: serde_json::Value =
             serde_json::from_str(EXTENSION_METADATA).expect("valid bundled helper metadata");
-        assert_eq!(metadata["version"], 10);
+        assert_eq!(metadata["version"], 11);
 
         for action in [
             "idle", "observe", "click", "drag", "scroll", "text", "key", "navigate", "app",
@@ -751,5 +760,24 @@ mod tests {
 
         assert!(!EXTENSION_SOURCE.contains("const VERTS"));
         assert!(!EXTENSION_SOURCE.contains("setSourceRGBA(0.10, 0.75, 1.00"));
+    }
+}
+
+#[cfg(test)]
+mod popup_metadata_tests {
+    use super::*;
+    #[test]
+    fn shell_relations_preserve_parent_and_modality() {
+        let raw = r#"[{"id":2,"pid":7,"x":1,"y":2,"w":204,"h":110,"transient_for":1,"modal":true,"window_type":"dialog"}]"#;
+        let child = parse_windows(raw, None).unwrap().remove(0);
+        assert_eq!(child.transient_for, Some(1));
+        assert_eq!(child.modal, Some(true));
+        assert_eq!(child.window_type.as_deref(), Some("dialog"));
+        let old = parse_windows(r#"[{"id":2,"pid":7,"x":1,"y":2,"w":204,"h":110}]"#, None)
+            .unwrap()
+            .remove(0);
+        assert_eq!(old.transient_for, None);
+        assert_eq!(old.modal, None);
+        assert_eq!(old.window_type, None);
     }
 }

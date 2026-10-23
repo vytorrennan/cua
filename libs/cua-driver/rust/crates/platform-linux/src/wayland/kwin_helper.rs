@@ -77,6 +77,9 @@ pub struct KwinWindow {
     pub active: bool,
     pub minimized: bool,
     pub stacking: usize,
+    pub transient_for: Option<u64>,
+    pub modal: Option<bool>,
+    pub window_type: Option<String>,
 }
 
 /// Whether KWin currently offers the target-bound input protocol (v2).
@@ -162,6 +165,9 @@ pub fn list_window_infos() -> Option<Vec<WindowInfo>> {
         list_windows()?
             .into_iter()
             .map(|window| WindowInfo {
+                transient_for: window.transient_for,
+                modal: window.modal,
+                window_type: window.window_type,
                 xid: window.token,
                 pid: Some(window.pid),
                 app_name: window.app_name,
@@ -190,10 +196,7 @@ pub fn pointer_position() -> Option<(f64, f64)> {
     let raw = call_to(&owner, "GetPointer", &[])?;
     let payload = parse_quoted_string(&raw)?;
     let value: serde_json::Value = serde_json::from_str(&payload).ok()?;
-    Some((
-        value.get("x")?.as_f64()?,
-        value.get("y")?.as_f64()?,
-    ))
+    Some((value.get("x")?.as_f64()?, value.get("y")?.as_f64()?))
 }
 
 /// Warp the real compositor pointer to a global/output point.
@@ -251,10 +254,19 @@ pub fn with_focused_window<T>(
              v{PROTOCOL_VERSION}) is loaded"
         )
     })?;
-    if trusted_window_for_id(pid, token).is_none() {
+    let target = trusted_window_for_id(pid, token);
+    if target.is_none() {
         anyhow::bail!(
             "foreground_unavailable: KWin window token {token} does not belong to pid {pid}"
         );
+    }
+
+    if target
+        .is_some_and(|window| matches!(window.window_type.as_deref(), Some("popup" | "tooltip")))
+    {
+        let restore = ACTIVE_INPUT_TOKEN.with(|active| active.replace(Some(token)));
+        let _guard = InputTokenGuard(restore);
+        return body();
     }
 
     let previous = call_to(&owner, "GetActiveToken", &[]).and_then(|raw| parse_first_i64(&raw));
@@ -286,13 +298,7 @@ pub fn move_to(token: u64, x: i32, y: i32) -> anyhow::Result<()> {
 
 /// Press and release a pointer button at an output-relative point without
 /// raising or activating the target window. The pointer is restored afterwards.
-pub fn click_background(
-    token: u64,
-    x: i32,
-    y: i32,
-    count: u32,
-    button: u8,
-) -> anyhow::Result<()> {
+pub fn click_background(token: u64, x: i32, y: i32, count: u32, button: u8) -> anyhow::Result<()> {
     let owner = background_owner()?;
     input_call(
         &owner,
@@ -778,9 +784,9 @@ pub fn set_window_frame(
     let mut observed = None;
     for _ in 0..24 {
         std::thread::sleep(Duration::from_millis(25));
-        if let Some(window) = list_windows().and_then(|windows| {
-            windows.into_iter().find(|window| window.token == token)
-        }) {
+        if let Some(window) = list_windows()
+            .and_then(|windows| windows.into_iter().find(|window| window.token == token))
+        {
             let frame = (window.x, window.y, window.width, window.height);
             observed = Some(frame);
             if frame == (x, y, width, height) {
@@ -793,12 +799,7 @@ pub fn set_window_frame(
 
 /// Press a pointer button without raising the target. The effect keeps the
 /// pointer and the held button until [`mouse_up_background`].
-pub fn mouse_down_background(
-    token: u64,
-    x: i32,
-    y: i32,
-    button: u8,
-) -> anyhow::Result<()> {
+pub fn mouse_down_background(token: u64, x: i32, y: i32, button: u8) -> anyhow::Result<()> {
     let owner = background_owner()?;
     input_call(
         &owner,
@@ -846,8 +847,7 @@ pub fn screen_geometry() -> Option<serde_json::Value> {
 /// Unlike a screen crop, this does not include covering windows or the agent
 /// cursor. `handle` is the KWin window UUID exposed by `GetWindows`.
 pub fn capture_window(token: u64) -> anyhow::Result<Vec<u8>> {
-    let window = window_for_token(token)
-        .ok_or_else(|| anyhow::anyhow!("unknown_window_token"))?;
+    let window = window_for_token(token).ok_or_else(|| anyhow::anyhow!("unknown_window_token"))?;
     let handle = window.handle;
     std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -903,8 +903,7 @@ async fn capture_workspace_async() -> anyhow::Result<Vec<u8>> {
         "org.kde.KWin.ScreenShot2",
     )
     .await?;
-    let mut options: std::collections::HashMap<String, Value> =
-        std::collections::HashMap::new();
+    let mut options: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     options.insert("include-decoration".into(), Value::from(false));
     options.insert("include-cursor".into(), Value::from(false));
     options.insert("include-shadow".into(), Value::from(false));
@@ -975,7 +974,8 @@ async fn capture_workspace_async() -> anyhow::Result<Vec<u8>> {
         &mut png,
         image::codecs::png::CompressionType::Fast,
         image::codecs::png::FilterType::Adaptive,
-    ).write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
+    )
+    .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
     Ok(png)
 }
 
@@ -1008,8 +1008,7 @@ async fn capture_window_async(handle: &str) -> anyhow::Result<Vec<u8>> {
         "org.kde.KWin.ScreenShot2",
     )
     .await?;
-    let mut options: std::collections::HashMap<String, Value> =
-        std::collections::HashMap::new();
+    let mut options: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     options.insert("include-decoration".into(), Value::from(true));
     options.insert("include-shadow".into(), Value::from(false));
     options.insert("native-resolution".into(), Value::from(false));
@@ -1079,7 +1078,8 @@ async fn capture_window_async(handle: &str) -> anyhow::Result<Vec<u8>> {
         &mut png,
         image::codecs::png::CompressionType::Fast,
         image::codecs::png::FilterType::Adaptive,
-    ).write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
+    )
+    .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)?;
     Ok(png)
 }
 
@@ -1156,6 +1156,15 @@ pub fn parse_snapshot(raw: &str) -> Option<Vec<KwinWindow>> {
                 active,
                 minimized: value.get("minimized")?.as_bool()?,
                 stacking: usize::try_from(value.get("stacking")?.as_u64()?).ok()?,
+                transient_for: value
+                    .get("transient_for")
+                    .and_then(serde_json::Value::as_u64)
+                    .filter(|id| *id != 0),
+                modal: value.get("modal").and_then(serde_json::Value::as_bool),
+                window_type: value
+                    .get("window_type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
             })
         })
         .collect()
@@ -1252,7 +1261,10 @@ fn native_call_body(
     use zbus::zvariant::{StructureBuilder, Value};
     let signature = match method {
         "GetNameOwner" | "GetConnectionUnixProcessID" | "GetConnectionUnixUser" => "s",
-        "Activate" | "BeginAccessibilityProbe" | "AdvanceAccessibilityProbe" | "EndAccessibilityProbe" => "x",
+        "Activate"
+        | "BeginAccessibilityProbe"
+        | "AdvanceAccessibilityProbe"
+        | "EndAccessibilityProbe" => "x",
         "Move" | "MouseMoveBackground" | "MouseButtonUpBackground" => "xii",
         "MovePointer" => "dd",
         "Click" | "ClickBackground" => "xiiui",
@@ -1512,5 +1524,29 @@ mod speed_transport_tests {
             parse_gvariant_string(&gvariant_string(&controls)),
             Some(controls)
         );
+    }
+}
+
+#[cfg(test)]
+mod popup_metadata_tests {
+    use super::*;
+    #[test]
+    fn snapshot_relations_are_optional_and_preserve_native_ids() {
+        let mut value = serde_json::json!({"token":2,"handle":"popup-uuid","pid":7,"x":1,"y":2,"w":204,"h":110,"active":false,"minimized":false,"stacking":4});
+        let old = parse_snapshot(&serde_json::json!([value.clone()]).to_string())
+            .unwrap()
+            .remove(0);
+        assert_eq!(old.transient_for, None);
+        assert_eq!(old.modal, None);
+        assert_eq!(old.window_type, None);
+        value["transient_for"] = serde_json::json!(1);
+        value["modal"] = serde_json::json!(false);
+        value["window_type"] = serde_json::json!("popup");
+        let new = parse_snapshot(&serde_json::json!([value]).to_string())
+            .unwrap()
+            .remove(0);
+        assert_eq!(new.transient_for, Some(1));
+        assert_eq!(new.modal, Some(false));
+        assert_eq!(new.window_type.as_deref(), Some("popup"));
     }
 }

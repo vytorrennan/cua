@@ -231,6 +231,9 @@ fn merge_atspi_records(
         });
 
         let mut window = WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid: id,
             pid: None,
             app_name: record.app_id,
@@ -298,6 +301,9 @@ mod tests {
 
     fn atspi(xid: u64, pid: u32, title: &str, app_name: &str, x: i32) -> WindowInfo {
         WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid,
             pid: Some(pid),
             app_name: app_name.to_owned(),

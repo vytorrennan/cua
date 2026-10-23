@@ -12,7 +12,7 @@ use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
 use x11rb::protocol::xproto::*;
 use x11rb::rust_connection::RustConnection;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WindowInfo {
     /// X11 Window (XID) cast to u64.
     pub xid: u64,
@@ -25,6 +25,17 @@ pub struct WindowInfo {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// Native compositor relationships. None means the provider did not
+    /// publish the value; titles and process identity never imply a parent.
+    pub transient_for: Option<u64>,
+    pub modal: Option<bool>,
+    pub window_type: Option<String>,
+}
+
+impl WindowInfo {
+    pub fn is_popup(&self) -> bool {
+        matches!(self.window_type.as_deref(), Some("popup" | "tooltip"))
+    }
 }
 
 /// The window the window manager reports as active (`_NET_ACTIVE_WINDOW`
@@ -132,6 +143,9 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
         };
 
         result.push(WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid: xid as u64,
             pid,
             app_name,
@@ -457,6 +471,9 @@ pub fn window_info(xid: u64) -> Option<WindowInfo> {
         .map(|(instance, class)| if class.is_empty() { instance } else { class })
         .unwrap_or_default();
     Some(WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         xid,
         pid,
         app_name,
@@ -790,6 +807,9 @@ mod tests {
 
     fn win(xid: u64, pid: Option<u32>, title: &str) -> WindowInfo {
         WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid,
             pid,
             app_name: String::new(),

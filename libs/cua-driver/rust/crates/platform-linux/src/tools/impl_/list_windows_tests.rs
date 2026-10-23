@@ -3,6 +3,9 @@ use super::*;
 #[test]
 fn record_has_bounds_and_flat_legacy_fields() {
     let w = crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         xid: 42,
         pid: Some(1234),
         app_name: "example-app".to_owned(),
@@ -42,6 +45,9 @@ fn record_has_bounds_and_flat_legacy_fields() {
 #[test]
 fn unavailable_wayland_order_serializes_as_null() {
     let w = crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         xid: 43,
         pid: Some(1234),
         app_name: "native-wayland-app".to_owned(),

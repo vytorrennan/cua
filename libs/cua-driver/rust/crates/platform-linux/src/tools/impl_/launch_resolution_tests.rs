@@ -2,6 +2,9 @@ use super::*;
 
 fn window(class: &str) -> crate::x11::WindowInfo {
     crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         xid: 1,
         pid: Some(7),
         app_name: class.into(),
@@ -51,6 +54,9 @@ fn launch_queries_match_window_classes() {
 
 fn owned(xid: u64, pid: u32, class: &str) -> crate::x11::WindowInfo {
     crate::x11::WindowInfo {
+        transient_for: None,
+        modal: None,
+        window_type: None,
         xid,
         pid: Some(pid),
         ..window(class)

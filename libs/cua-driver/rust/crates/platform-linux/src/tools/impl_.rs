@@ -28,9 +28,11 @@ fn window_target_candidates_for_pid(
         .filter(|window| window.pid == Some(pid))
         .map(|window| WindowTargetCandidate {
             window_id: window.xid,
-            transient_for: (!crate::wayland::is_wayland())
-                .then(|| crate::x11::transient_for(window.xid))
-                .flatten(),
+            transient_for: if crate::wayland::is_wayland() {
+                window.transient_for
+            } else {
+                crate::x11::transient_for(window.xid)
+            },
             title: window.title,
             app_name: Some(window.app_name),
             is_on_screen: window.is_on_screen,
@@ -622,7 +624,7 @@ impl Tool for ListWindowsTool {
 /// no schema_version bump.
 ///
 fn window_record_json(w: &crate::x11::WindowInfo) -> Value {
-    json!({
+    let mut record = json!({
         "window_id": w.xid,
         "pid": w.pid,
         "app_name": w.app_name,
@@ -634,11 +636,39 @@ fn window_record_json(w: &crate::x11::WindowInfo) -> Value {
         // Legacy alias: flat fields kept inline for pre-existing callers.
         "x": w.x, "y": w.y,
         "width": w.width, "height": w.height,
-    })
+    });
+    append_window_metadata(&mut record, w);
+    record
+}
+
+/// A pid-only observation follows a mapped popup, then an owned dialog, then
+/// the topmost visible native window. Never consult X11 IDs on Wayland.
+fn wayland_observation_window(windows: &[crate::x11::WindowInfo], pid: u32) -> Option<u64> {
+    windows
+        .iter()
+        .filter(|w| w.pid == Some(pid) && w.is_on_screen && w.width > 0 && w.height > 0)
+        .max_by_key(|w| (w.is_popup(), w.transient_for.is_some(), w.z_index))
+        .map(|w| w.xid)
+}
+
+fn append_window_metadata(record: &mut Value, window: &crate::x11::WindowInfo) {
+    if let Some(parent) = window.transient_for {
+        record["transient_for"] = json!(parent);
+    }
+    if let Some(modal) = window.modal {
+        record["modal"] = json!(modal);
+    }
+    if let Some(kind) = &window.window_type {
+        record["window_type"] = json!(kind);
+        record["popup"] = json!(window.is_popup());
+    }
 }
 
 #[cfg(test)]
 mod list_windows_tests;
+
+#[cfg(test)]
+mod wayland_window_metadata_tests;
 
 // ── get_window_state ─────────────────────────────────────────────────────────
 
@@ -904,9 +934,12 @@ impl WindowOverlays {
         for dialog in &self.dialogs {
             let id = dialog["window_id"].as_u64().unwrap_or(0);
             let owning_pid = dialog.get("owning_pid").and_then(|v| v.as_u64());
+            let target_pid = owning_pid
+                .or_else(|| dialog.get("pid").and_then(Value::as_u64))
+                .unwrap_or(u64::from(pid));
             parts.push(format!(
                 "dialog \"{}\" (window_id {id}, transient of window {}{}{}) is open over this \
-                 window: call get_window_state(pid={pid}, window_id={id}) to index it and act \
+                 window: call get_window_state(pid={target_pid}, window_id={id}) to index it and act \
                  there (pid-only keys go to it).",
                 dialog["title"].as_str().unwrap_or(""),
                 dialog["transient_for"].as_u64().unwrap_or(0),
@@ -924,9 +957,14 @@ impl WindowOverlays {
         }
         for popup in &self.popups {
             let id = popup["window_id"].as_u64().unwrap_or(0);
+            let target_pid = popup
+                .get("owning_pid")
+                .or_else(|| popup.get("pid"))
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::from(pid));
             parts.push(format!(
                 "popup (window_id {id}, bounds x={} y={} {}x{}) is open: call \
-                 get_window_state(pid={pid}, window_id={id}) to index its items and click them \
+                 get_window_state(pid={target_pid}, window_id={id}) to index its items and click them \
                  by element_token.",
                 popup["bounds"]["x"],
                 popup["bounds"]["y"],
@@ -1011,6 +1049,40 @@ fn window_overlays(pid: u32, xid: u64) -> WindowOverlays {
         out.popups.push(popup.to_json());
     }
     out.covers_window = covers;
+    out
+}
+
+fn wayland_window_overlays(
+    windows: &[crate::x11::WindowInfo],
+    pid: u32,
+    xid: u64,
+) -> WindowOverlays {
+    let mut out = WindowOverlays {
+        window_rect: windows
+            .iter()
+            .find(|w| w.xid == xid && w.pid == Some(pid))
+            .map(|w| (w.x, w.y, w.width, w.height)),
+        ..Default::default()
+    };
+    for child in windows.iter().filter(|w| {
+        w.is_on_screen
+            && w.width > 0
+            && w.height > 0
+            && crate::wayland::window_relations::is_descendant(windows, w.xid, xid)
+    }) {
+        let mut record = window_record_json(child);
+        if child.pid != Some(pid) {
+            record["owning_pid"] = json!(child.pid);
+        }
+        out.covers_window |= out.window_rect.is_some_and(|target| {
+            rects_intersect(target, (child.x, child.y, child.width, child.height))
+        });
+        if child.is_popup() {
+            out.popups.push(record);
+        } else {
+            out.dialogs.push(record);
+        }
+    }
     out
 }
 
@@ -1147,6 +1219,12 @@ impl Tool for GetWindowStateTool {
             Some(v) => v,
             None => {
                 let chosen = tokio::task::spawn_blocking(move || {
+                    if crate::wayland::is_wayland() {
+                        return wayland_observation_window(
+                            &crate::wayland::list_windows_dispatch(Some(pid)),
+                            pid,
+                        );
+                    }
                     if let Some(popup) = crate::input::mapped_popup_windows()
                         .into_iter()
                         .rev()
@@ -1273,11 +1351,16 @@ impl Tool for GetWindowStateTool {
         let popup_meta = (!crate::wayland::is_wayland())
             .then(|| crate::input::popup_window_info(xid))
             .flatten();
-        let window_meta = crate::wayland::list_windows_dispatch(Some(pid))
-            .into_iter()
+        let native_windows = crate::wayland::list_windows_dispatch(None);
+        let window_meta = native_windows
+            .iter()
+            .cloned()
             .find(|w| w.xid == xid)
             .or_else(|| {
                 popup_meta.as_ref().map(|popup| crate::x11::WindowInfo {
+                    transient_for: None,
+                    modal: None,
+                    window_type: None,
                     xid: popup.window,
                     pid: popup.pid,
                     app_name: String::new(),
@@ -1338,8 +1421,7 @@ impl Tool for GetWindowStateTool {
         let state_for_capture = state.clone();
         let query_for_walk = query.clone();
         let require_window_scope = crate::wayland::is_wayland()
-            && (crate::wayland::hyprland::is_session()
-                || crate::wayland::kwin_helper::available());
+            && (crate::wayland::hyprland::is_session() || crate::wayland::kwin_helper::available());
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             // Skip the AT-SPI walk on the capture-only path
@@ -1377,7 +1459,7 @@ impl Tool for GetWindowStateTool {
             // the window the screenshot is taken from the screen, since the
             // window's own drawable never shows them.
             let overlays = if crate::wayland::is_wayland() {
-                WindowOverlays::default()
+                wayland_window_overlays(&native_windows, pid, xid)
             } else {
                 window_overlays(pid, xid)
             };
@@ -1392,7 +1474,7 @@ impl Tool for GetWindowStateTool {
                 };
                 let captured = if let Some((png, width, height)) = preview {
                     Ok((png, Some((width, height))))
-                } else if overlays.covers_window {
+                } else if overlays.covers_window && !crate::wayland::is_wayland() {
                     overlays
                         .window_rect
                         .ok_or_else(|| anyhow::anyhow!("window geometry unavailable"))
@@ -1791,6 +1873,7 @@ impl Tool for GetWindowStateTool {
                     structured["popup"] = json!(true);
                 }
                 if let Some(meta) = &window_meta {
+                    append_window_metadata(&mut structured, meta);
                     if !meta.app_name.is_empty() {
                         structured["app_name"] = json!(meta.app_name);
                     }
@@ -1810,7 +1893,12 @@ impl Tool for GetWindowStateTool {
                     structured["popups"] = json!(overlays.popups);
                 }
                 if overlays.covers_window {
-                    structured["screenshot_composited"] = json!(true);
+                    if crate::wayland::is_wayland() {
+                        structured["covered_by_owned_surface"] = json!(true);
+                        structured["window_capture_includes_popups"] = json!(false);
+                    } else {
+                        structured["screenshot_composited"] = json!(true);
+                    }
                 }
                 if let Some(note) = overlays.follow_up(pid) {
                     structured["follow_up"] = json!(note);
@@ -3126,11 +3214,11 @@ fn unavailable_webkit_keyboard_background(
         && is_webkitgtk_embedder(pid)
         && !crate::wayland::is_inject_mode()
         && !kwin_background_available())
-        .then(|| {
-            crate::input::delivery::background_unavailable_error(
-                crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-            )
-        })
+    .then(|| {
+        crate::input::delivery::background_unavailable_error(
+            crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+        )
+    })
 }
 
 /// Operator-facing hint attached to a background keyboard refusal on X11: the
@@ -3505,10 +3593,7 @@ fn kwin_background_token(pid: u32, xid: u64) -> Option<u64> {
     crate::wayland::kwin_helper::trusted_window_for_id(pid, xid).map(|window| window.token)
 }
 
-fn kwin_background_window(
-    pid: u32,
-    xid: u64,
-) -> Option<crate::wayland::kwin_helper::KwinWindow> {
+fn kwin_background_window(pid: u32, xid: u64) -> Option<crate::wayland::kwin_helper::KwinWindow> {
     if !kwin_background_available() {
         return None;
     }
@@ -3565,7 +3650,11 @@ async fn kwin_background_type(
         Ok(Ok(())) => ToolResult::text(format!(
             "Typed {text_len} character(s) (via KWin background keyboard)."
         ))
-        .with_structured(type_text_structured("cua_compositor_inject", text_len, false)),
+        .with_structured(type_text_structured(
+            "cua_compositor_inject",
+            text_len,
+            false,
+        )),
         Ok(Err(error)) => ToolResult::error(error.to_string()),
         Err(error) => ToolResult::error(format!("Task error: {error}")),
     })
@@ -7325,9 +7414,11 @@ impl Tool for ClickTool {
                     })
                     .await;
                     if matches!(semantic, Ok(Ok(Some(_)))) {
-                        return ToolResult::text("Dispatched AT-SPI click.").with_structured(json!({
-                            "path": "wayland_atspi", "verified": false, "effect": "unverifiable"
-                        }));
+                        return ToolResult::text("Dispatched AT-SPI click.").with_structured(
+                            json!({
+                                "path": "wayland_atspi", "verified": false, "effect": "unverifiable"
+                            }),
+                        );
                     }
                 }
                 let click = tokio::task::spawn_blocking(move || {
@@ -8914,14 +9005,9 @@ impl Tool for PressKeyTool {
         // KWin protocol v3: route the key/chord to one exact window surface
         // without activating it (compositor-side keyboard focus swap).
         if !delivery.is_foreground() && crate::wayland::wayland_input_enabled() {
-            if let Some(result) = kwin_background_key(
-                pid,
-                xid,
-                key.clone(),
-                mods.clone(),
-                resolved_element_index,
-            )
-            .await
+            if let Some(result) =
+                kwin_background_key(pid, xid, key.clone(), mods.clone(), resolved_element_index)
+                    .await
             {
                 return result;
             }
@@ -9434,14 +9520,9 @@ impl Tool for HotkeyTool {
             }
         };
         if !delivery.is_foreground() && crate::wayland::wayland_input_enabled() {
-            if let Some(result) = kwin_background_key(
-                pid,
-                xid,
-                key.clone(),
-                mods.clone(),
-                resolved_element_index,
-            )
-            .await
+            if let Some(result) =
+                kwin_background_key(pid, xid, key.clone(), mods.clone(), resolved_element_index)
+                    .await
             {
                 return result;
             }
@@ -10330,7 +10411,8 @@ impl Tool for ScrollTool {
                     (
                         None,
                         cua_driver_core::element_token::ResolvedElement::Element {
-                            element_index, ..
+                            element_index,
+                            ..
                         },
                     ) => {
                         let idx = *element_index;
@@ -10345,11 +10427,7 @@ impl Tool for ScrollTool {
                     _ => None,
                 };
                 let output_point = local_point.map(|(x, y)| {
-                    crate::wayland::window_local_to_output(
-                        xid,
-                        x.round() as i32,
-                        y.round() as i32,
-                    )
+                    crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32)
                 });
                 let point = output_point.unwrap_or_else(|| {
                     crate::wayland::kwin_helper::window_for_token(token)
@@ -11636,12 +11714,7 @@ impl Tool for DragTool {
                     (to_x.round() as i32, to_y.round() as i32),
                 ));
                 let result = tokio::task::spawn_blocking(move || {
-                    crate::wayland::kwin_helper::drag_background(
-                        token,
-                        (fx, fy),
-                        (tx, ty),
-                        button,
-                    )
+                    crate::wayland::kwin_helper::drag_background(token, (fx, fy), (tx, ty), button)
                 })
                 .await;
                 return match result {
@@ -12095,8 +12168,7 @@ impl Tool for MouseButtonDownTool {
         // the existing input::send_button_down behaviour.
         let result = if is_wl {
             if let Some(token) = kwin_background_token(pid, xid) {
-                let (output_x, output_y) =
-                    crate::wayland::window_local_to_output(xid, xi, yi);
+                let (output_x, output_y) = crate::wayland::window_local_to_output(xid, xi, yi);
                 tokio::task::spawn_blocking(move || {
                     crate::wayland::kwin_helper::mouse_down_background(
                         token, output_x, output_y, button,
@@ -12113,9 +12185,7 @@ impl Tool for MouseButtonDownTool {
                     crate::wayland::window_local_to_output,
                 );
                 tokio::task::spawn_blocking(move || {
-                    crate::wayland::persistent_vptr::press(
-                        &cid, xid, output_x, output_y, button,
-                    )
+                    crate::wayland::persistent_vptr::press(&cid, xid, output_x, output_y, button)
                 })
                 .await
             }
@@ -12492,12 +12562,9 @@ impl Tool for MouseButtonUpTool {
         // (single logical drag rather than a click pair).
         let result = if crate::wayland::is_wayland() {
             if let Some(token) = kwin_background_token(hold.pid, hold.xid) {
-                let (output_x, output_y) =
-                    crate::wayland::window_local_to_output(xid, xi, yi);
+                let (output_x, output_y) = crate::wayland::window_local_to_output(xid, xi, yi);
                 tokio::task::spawn_blocking(move || {
-                    crate::wayland::kwin_helper::mouse_up_background(
-                        token, output_x, output_y,
-                    )
+                    crate::wayland::kwin_helper::mouse_up_background(token, output_x, output_y)
                 })
                 .await
             } else {
@@ -12646,12 +12713,9 @@ async fn parallel_drag_kwin(args: &Value) -> ToolResult {
             .map(|windows| !windows.iter().any(|window| window.token == token))
             .unwrap_or(true)
         {
-            return ToolResult::error(format!(
-                "window_id {token} is no longer a live KWin window"
-            ));
+            return ToolResult::error(format!("window_id {token} is no longer a live KWin window"));
         }
-        let points: Vec<(f64, f64)> = if let Some(path) =
-            item.get("path").and_then(Value::as_array)
+        let points: Vec<(f64, f64)> = if let Some(path) = item.get("path").and_then(Value::as_array)
         {
             let mut out = Vec::with_capacity(path.len());
             for point in path {
@@ -12685,12 +12749,9 @@ async fn parallel_drag_kwin(args: &Value) -> ToolResult {
             }
         } else {
             let get = |key: &str| item.get(key).and_then(Value::as_f64);
-            let (Some(from_x), Some(from_y), Some(to_x), Some(to_y)) = (
-                get("from_x"),
-                get("from_y"),
-                get("to_x"),
-                get("to_y"),
-            ) else {
+            let (Some(from_x), Some(from_y), Some(to_x), Some(to_y)) =
+                (get("from_x"), get("from_y"), get("to_x"), get("to_y"))
+            else {
                 return ToolResult::error(
                     "each drag item requires path[] or fn or from_x/from_y/to_x/to_y.",
                 );
@@ -12703,21 +12764,15 @@ async fn parallel_drag_kwin(args: &Value) -> ToolResult {
             (0..=steps)
                 .map(|step| {
                     let t = step as f64 / steps as f64;
-                    (
-                        from_x + (to_x - from_x) * t,
-                        from_y + (to_y - from_y) * t,
-                    )
+                    (from_x + (to_x - from_x) * t, from_y + (to_y - from_y) * t)
                 })
                 .collect()
         };
         if points.len() < 2 {
             return ToolResult::error("drag path needs at least 2 points.");
         }
-        let button = parse_mouse_button(
-            item.get("button")
-                .and_then(Value::as_str)
-                .unwrap_or("left"),
-        );
+        let button =
+            parse_mouse_button(item.get("button").and_then(Value::as_str).unwrap_or("left"));
         drags.push(Drag {
             token,
             button,
@@ -13100,23 +13155,15 @@ impl Tool for GetScreenSizeTool {
             }
             if crate::wayland::is_wayland() && crate::wayland::kwin_helper::available() {
                 if let Some(geometry) = crate::wayland::kwin_helper::screen_geometry() {
-                    let width = geometry
-                        .get("width")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32;
-                    let height = geometry
-                        .get("height")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as u32;
+                    let width = geometry.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    let height = geometry.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
                     let scale = geometry
                         .get("outputs")
                         .and_then(Value::as_array)
                         .and_then(|outputs| {
                             outputs
                                 .iter()
-                                .filter_map(|output| {
-                                    output.get("scale").and_then(Value::as_f64)
-                                })
+                                .filter_map(|output| output.get("scale").and_then(Value::as_f64))
                                 .reduce(f64::max)
                         })
                         .unwrap_or(1.0);
@@ -13220,11 +13267,7 @@ fn x11_screen_size() -> anyhow::Result<(u32, u32)> {
 /// points. Delivering a backing-pixel PNG therefore makes every click miss by
 /// the output scale. Resize once here so the delivered image, element frames,
 /// and input coordinates all share one frame.
-fn resize_png_exact_frame(
-    png: Vec<u8>,
-    width: u32,
-    height: u32,
-) -> anyhow::Result<Vec<u8>> {
+fn resize_png_exact_frame(png: Vec<u8>, width: u32, height: u32) -> anyhow::Result<Vec<u8>> {
     if width == 0 || height == 0 {
         anyhow::bail!("window action frame is empty: {width}x{height}");
     }
@@ -14862,22 +14905,22 @@ impl Tool for InvokeMenuTool {
                         .ok()
                         .flatten();
                     match origin {
-                        Some(origin) => {
-                            crate::atspi::native::invoke_menu_path_in_with_first_click(
-                                pid,
-                                window_id,
-                                &path,
-                                Some(origin),
-                                |x, y| {
-                                    crate::wayland::kwin_helper::click_background(
-                                        window.token, x, y, 1, 1,
-                                    )
-                                    .map_err(|error| {
-                                        anyhow::anyhow!("menu open click failed: {error}")
-                                    })
-                                },
-                            )
-                        }
+                        Some(origin) => crate::atspi::native::invoke_menu_path_in_with_first_click(
+                            pid,
+                            window_id,
+                            &path,
+                            Some(origin),
+                            |x, y| {
+                                crate::wayland::kwin_helper::click_background(
+                                    window.token,
+                                    x,
+                                    y,
+                                    1,
+                                    1,
+                                )
+                                .map_err(|error| anyhow::anyhow!("menu open click failed: {error}"))
+                            },
+                        ),
                         None => crate::atspi::native::invoke_menu_path_in(pid, window_id, &path),
                     }
                 }
@@ -14957,9 +15000,7 @@ impl Tool for SetWindowFrameTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
-        if crate::wayland::is_wayland()
-            && !crate::wayland::kwin_helper::supports_background()
-        {
+        if crate::wayland::is_wayland() && !crate::wayland::kwin_helper::supports_background() {
             return ToolResult::error(
                 "set_window_frame: this Wayland compositor exposes no protocol that permits a client to set another top-level window's geometry",
             );
@@ -15009,22 +15050,15 @@ impl Tool for SetWindowFrameTool {
         let pid = input.pid;
         let outcome = tokio::task::spawn_blocking(move || {
             if crate::wayland::is_wayland() {
-                let token =
-                    crate::wayland::kwin_helper::trusted_window_for_id(pid, window_id)
-                        .map(|window| window.token)
-                        .ok_or_else(|| {
-                            "KWin no longer recognizes this window token".to_owned()
-                        })?;
+                let token = crate::wayland::kwin_helper::trusted_window_for_id(pid, window_id)
+                    .map(|window| window.token)
+                    .ok_or_else(|| "KWin no longer recognizes this window token".to_owned())?;
                 let before = crate::wayland::kwin_helper::list_windows()
-                    .and_then(|windows| {
-                        windows.into_iter().find(|window| window.token == token)
-                    })
+                    .and_then(|windows| windows.into_iter().find(|window| window.token == token))
                     .map(|window| (window.x, window.y, window.width, window.height));
                 let (confirmed, observed) =
-                    crate::wayland::kwin_helper::set_window_frame(
-                        token, x, y, width, height,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    crate::wayland::kwin_helper::set_window_frame(token, x, y, width, height)
+                        .map_err(|error| error.to_string())?;
                 let changed = observed.is_some_and(|observed| before != Some(observed));
                 Ok::<_, String>((observed, confirmed, changed, None))
             } else {
@@ -15058,13 +15092,10 @@ impl Tool for SetWindowFrameTool {
         } else {
             ActionTransport::LinuxX11ConfigureWindow
         };
-        let mut record = ActionExecutionRecord::builder(
-            effect,
-            transport,
-            RequestedDelivery::NotApplicable,
-        )
-        .actual_delivery(ActualDelivery::NotApplicable)
-        .detail(format!(
+        let mut record =
+            ActionExecutionRecord::builder(effect, transport, RequestedDelivery::NotApplicable)
+                .actual_delivery(ActualDelivery::NotApplicable)
+                .detail(format!(
             "requested={requested:?} observed={observed:?} mutation_error={mutation_error:?}"
         ));
         if observed.is_some() {

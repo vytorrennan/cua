@@ -50,8 +50,8 @@ namespace
 {
 constexpr auto kService = "org.cua.KWinTarget";
 constexpr auto kPath = "/org/cua/KWinTarget";
-constexpr quint32 kProtocolVersion = 4;
-constexpr auto kBuild = "2026-10-23.1-accessibility-identity";
+constexpr quint32 kProtocolVersion = 5;
+constexpr auto kBuild = "2026-10-23.3-popup-target-guards";
 
 using Microseconds = std::chrono::microseconds;
 
@@ -195,6 +195,30 @@ bool isUserToplevel(KWin::Window *window)
         return false;
     }
     return window->resourceClass() != QLatin1String("cua-driver");
+}
+
+bool isUserPopup(KWin::Window *window)
+{
+    if (!window || window->isDeleted() || !window->surface()
+        || !(window->isPopupWindow() || window->isDropdownMenu() || window->isPopupMenu()
+             || window->isTooltip() || window->isComboBox())) {
+        return false;
+    }
+    // Only expose popups whose compositor-owned parent chain reaches a user
+    // window. Plasma panels, notifications and Cua overlays stay excluded.
+    QSet<KWin::Window *> seen;
+    for (auto *parent = window->transientFor(); parent && !seen.contains(parent);
+         parent = parent->transientFor()) {
+        if (parent->isDeleted()) return false;
+        if (isUserToplevel(parent)) return true;
+        seen.insert(parent);
+    }
+    return false;
+}
+
+bool isUserSurface(KWin::Window *window)
+{
+    return isUserToplevel(window) || isUserPopup(window);
 }
 
 // KWin's normal pointer path activates a window on button press. Background
@@ -361,7 +385,7 @@ public slots:
             return errJson(QStringLiteral("input_busy"));
         }
         auto *window = windowForToken(token);
-        if (!window || window->isMinimized()) {
+        if (!window || window->isMinimized() || isUserPopup(window)) {
             return errJson(QStringLiteral("target_unavailable"));
         }
         m_probePrevious = KWin::workspace()->activeWindow();
@@ -448,7 +472,7 @@ public slots:
         const auto liveWindows = KWin::Workspace::self()->windows();
         QSet<QUuid> liveIds;
         for (KWin::Window *window : liveWindows) {
-            if (isUserToplevel(window)) {
+            if (isUserSurface(window)) {
                 liveIds.insert(window->internalId());
             }
         }
@@ -462,7 +486,7 @@ public slots:
 
         QJsonArray windows;
         for (KWin::Window *window : liveWindows) {
-            if (!isUserToplevel(window)) {
+            if (!isUserSurface(window)) {
                 continue;
             }
             const auto frame = window->frameGeometry();
@@ -479,6 +503,13 @@ public slots:
             record["active"] = window->isActive();
             record["minimized"] = window->isMinimized();
             record["stacking"] = window->stackingOrder();
+            auto *parent = window->transientFor();
+            record["transient_for"] = parent && isUserSurface(parent)
+                ? QJsonValue(static_cast<qint64>(tokenFor(parent->internalId()))) : QJsonValue();
+            record["modal"] = window->isModal();
+            record["window_type"] = isUserPopup(window)
+                ? (window->isTooltip() ? "tooltip" : "popup")
+                : (window->isDialog() ? "dialog" : "normal");
             windows.push_back(record);
         }
         return QString::fromUtf8(QJsonDocument(windows).toJson(QJsonDocument::Compact));
@@ -731,9 +762,14 @@ public slots:
             return errJson(QStringLiteral("input_busy"));
         }
         QString error;
-        KWin::Window *window = windowForToken(token);
+        KWin::Window *window = windowForToken(token, true);
         if (!window) {
             return errJson(QStringLiteral("unknown_token"));
+        }
+        // xdg_popup surfaces cannot be activated as toplevels. Their existing
+        // grab and exact pointer surface are sufficient for a targeted click.
+        if (isUserPopup(window)) {
+            return ClickBackground(token, x, y, button, count);
         }
         const QPointF point(x, y);
         if (!window->frameGeometry().contains(point)) {
@@ -1101,9 +1137,12 @@ public slots:
             return errJson(QStringLiteral("input_busy"));
         }
         QString error;
-        KWin::Window *window = windowForToken(token);
+        KWin::Window *window = windowForToken(token, true);
         if (!window) {
             return errJson(QStringLiteral("unknown_token"));
+        }
+        if (isUserPopup(window) && count != 1) {
+            return errJson(QStringLiteral("popup_requires_single_click"));
         }
         const QPointF point(x, y);
         if (!window->frameGeometry().contains(point)) {
@@ -1114,7 +1153,8 @@ public slots:
         }
         const QPointF saved = KWin::input()->globalPointer();
         KWin::Window *previous = KWin::workspace() ? KWin::workspace()->activeWindow() : nullptr;
-        StackingGuard stackingGuard(window);
+        StackingGuard stackingGuard(window, !isUserPopup(window));
+        if (isUserPopup(window)) stackingGuard.disarm();
         ActiveWindowGuard activeGuard(previous);
         auto *pointer = KWin::input()->pointer();
         movePointerToPoint(point);
@@ -1537,7 +1577,7 @@ private:
         return token;
     }
 
-    KWin::Window *windowForToken(qint64 token)
+    KWin::Window *windowForToken(qint64 token, bool allowPopup = false)
     {
         if (token <= 0) {
             return nullptr;
@@ -1553,7 +1593,7 @@ private:
                 continue;
             }
             liveIds.insert(window->internalId());
-            if (!window->isClient()) {
+            if (!isUserToplevel(window) && !(allowPopup && isUserPopup(window))) {
                 continue;
             }
             const auto it = m_tokens.constFind(window->internalId());

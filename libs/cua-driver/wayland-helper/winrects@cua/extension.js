@@ -5,6 +5,7 @@ import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
 import Cairo from 'cairo';
+import Meta from 'gi://Meta';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 
@@ -861,7 +862,7 @@ export default class WinRectsExtension extends Extension {
     }
   }
   GetVersion() {
-    return 10;
+    return 11;
   }
   GetRects() {
     const actors = global.get_window_actors();
@@ -883,6 +884,13 @@ export default class WinRectsExtension extends Extension {
         // Older Shell releases may not expose the buffer rectangle.
       }
       const minimized = Boolean(w.minimized);
+      const parent = w.get_transient_for();
+      const type = w.get_window_type();
+      const popupTypes = [Meta.WindowType.MENU, Meta.WindowType.DROPDOWN_MENU,
+        Meta.WindowType.POPUP_MENU, Meta.WindowType.COMBO];
+      const kind = type === Meta.WindowType.TOOLTIP ? 'tooltip'
+        : popupTypes.includes(type) ? 'popup'
+          : [Meta.WindowType.DIALOG, Meta.WindowType.MODAL_DIALOG].includes(type) ? 'dialog' : 'normal';
       out.push({
         id: w.get_stable_sequence(),
         pid: w.get_pid(),
@@ -897,6 +905,9 @@ export default class WinRectsExtension extends Extension {
         minimized,
         visible: Boolean(actor?.visible) && !minimized,
         stacking,
+        transient_for: parent?.get_stable_sequence() ?? null,
+        modal: w.is_modal(),
+        window_type: kind,
       });
     }
     return JSON.stringify(out);

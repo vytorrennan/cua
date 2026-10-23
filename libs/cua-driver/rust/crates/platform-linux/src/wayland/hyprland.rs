@@ -1601,6 +1601,9 @@ mod tests {
             desktop_frame_from_monitors(vec![monitor_at("A", -1920, 0), monitor_at("B", 0, 0)])
                 .unwrap();
         let mut windows = vec![crate::x11::WindowInfo {
+            transient_for: None,
+            modal: None,
+            window_type: None,
             xid: 1,
             pid: Some(42),
             app_name: "fixture".into(),
