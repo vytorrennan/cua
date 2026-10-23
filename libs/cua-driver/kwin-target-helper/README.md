@@ -5,7 +5,8 @@ the portable `cua-driver` binary and must be built against the user's installed
 KWin/Qt/KF6 development files. Do not use a helper built for a different KWin
 or Qt ABI.
 
-This fork adds protocol-v3 input methods alongside trusted window metadata.
+This fork adds protocol-v3 input and protocol-v4 accessibility identity methods
+alongside trusted window metadata.
 The helper resolves opaque window tokens inside KWin, validates callers and
 targets, and delivers input through the compositor. The driver verifies that
 the D-Bus service belongs to the current user's KWin process and binds the
@@ -71,15 +72,35 @@ closes the window, and aborted requests release their owned keys. Overlapping
 writes return `input_busy` while metadata remains readable. The driver does
 not replay dispatched input automatically after a transport error.
 
-Accessibility rows require an independently matched native window. When two
-windows share a title and size, the driver can still return the exact window
-screenshot, but withholds an unproven application-wide tree. The response marks
+Accessibility rows require an independently matched native window. Geometry
+matching accounts for Wayland's window-local origins and requires an unambiguous
+match in both directions. Windows with identical titles and sizes use a bounded
+focus calibration when no lifetime identity has been established. The helper
+briefly clears focus and focuses the exact target twice, without raising it or
+sending keys, clicks or pointer motion. The driver requires the same accessible
+frame to acknowledge both leave/enter sequences. Compositor focus epochs detect
+intervening changes, including a move away and back. The helper restores the
+previous focus and stacking order before the read completes. Applications can
+observe these transient focus changes.
+
+The mapping joins KWin's window UUID to the accessibility bus/object reference.
+Later reads reuse that mapping without changing focus, including after title,
+size or focus changes. Closed windows and replaced accessibility objects lose
+their bindings. A scoped tree walk visits only the requested window, so an
+unresponsive sibling does not consume its budget. Input cannot overlap a
+calibration; the helper releases an
+abandoned lease after 1.5 seconds. A user's intervening focus change supersedes
+restoration. `GetFocusState`, `BeginAccessibilityProbe`,
+`AdvanceAccessibilityProbe` and `EndAccessibilityProbe` require helper protocol
+v4. Earlier helpers retain ordinary title/geometry matching.
+
+When accessibility is absent, a calibration is interrupted or the caller's
+deadline expires, the driver withholds an unproven tree. The response marks
 `accessibility_window_scoped: false`, `elements_complete: false` and
 `degraded_reason: accessibility_window_identity_unproven: ...`, with no
 unrelated rows or actionable element snapshot. Previous element snapshots for
 that window are invalidated. A screenshot-only read cannot revive their tokens.
-Use screenshot coordinates while the accessibility identity is unresolved.
-A uniquely matched title or geometry keeps normal accessibility rows available.
+Use screenshot coordinates or retry after the interruption in that case.
 
 Bulk text and Unicode use clipboard paste. Clipboard transactions preserve
 native payload formats, support empty selections and retain a different text

@@ -50,8 +50,8 @@ namespace
 {
 constexpr auto kService = "org.cua.KWinTarget";
 constexpr auto kPath = "/org/cua/KWinTarget";
-constexpr quint32 kProtocolVersion = 3;
-constexpr auto kBuild = "2026-10-22.12-ordered-input";
+constexpr quint32 kProtocolVersion = 4;
+constexpr auto kBuild = "2026-10-23.1-accessibility-identity";
 
 using Microseconds = std::chrono::microseconds;
 
@@ -310,8 +310,17 @@ class TargetApi : public QObject, protected QDBusContext
     Q_CLASSINFO("D-Bus Interface", "org.cua.KWinTarget")
 
 public:
+    TargetApi()
+    {
+        connect(KWin::workspace(), &KWin::Workspace::windowActivated, this,
+                [this](KWin::Window *) { ++m_focusEpoch; });
+        connect(KWin::waylandServer()->seat(), &KWin::SeatInterface::focusedKeyboardSurfaceAboutToChange,
+                this, [this](KWin::SurfaceInterface *) { ++m_focusEpoch; });
+    }
+
     ~TargetApi() override
     {
+        finishAccessibilityProbe();
         if (m_keyboardOwner) {
             for (uint32_t code : std::as_const(m_ownedKeys)) {
                 m_keyboardOwner->processKey(code, KWin::KeyboardKeyState::Released, nowUs(), nullptr);
@@ -328,6 +337,110 @@ public slots:
     Q_SCRIPTABLE QString GetBuild()
     {
         return QString::fromLatin1(kBuild);
+    }
+
+    // Epoch brackets detect intervening focus changes, including an A/B/A
+    // round trip. Pointer focus, window order and geometry are not identity.
+    Q_SCRIPTABLE QString GetFocusState()
+    {
+        QJsonObject object;
+        auto *window = KWin::workspace()->activeWindow();
+        object["epoch"] = static_cast<qint64>(m_focusEpoch);
+        object["active_token"] = window ? static_cast<qint64>(tokenFor(window->internalId())) : 0;
+        object["keyboard_token"] = keyboardFocusToken();
+        object["calibrating"] = m_probeLease != 0;
+        return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    }
+
+    Q_SCRIPTABLE QString BeginAccessibilityProbe(qint64 token)
+    {
+        if (!callerAllowed()) {
+            return errJson(QStringLiteral("not_authorized"));
+        }
+        if (m_inputBusy || m_holdActive) {
+            return errJson(QStringLiteral("input_busy"));
+        }
+        auto *window = windowForToken(token);
+        if (!window || window->isMinimized()) {
+            return errJson(QStringLiteral("target_unavailable"));
+        }
+        m_probePrevious = KWin::workspace()->activeWindow();
+        m_probePreviousKeyboard = keyboardFocusToken();
+        m_probeTarget = window;
+        m_probeCaller = calledFromDBus() ? message().service() : QString();
+        m_probeOrder.clear();
+        for (auto *item : KWin::workspace()->stackingOrder()) {
+            m_probeOrder.push_back(item);
+        }
+        const quint64 lease = ++m_nextProbeLease;
+        m_probeLease = lease;
+        m_inputBusy = true;
+        // First require the client to acknowledge focus leaving. Otherwise a
+        // delayed active-state event from another window could be misbound.
+        m_probePhase = 0;
+        KWin::workspace()->activateWindow(nullptr);
+        m_probeEpoch = m_focusEpoch;
+        if (KWin::workspace()->activeWindow() || keyboardFocusToken() != 0) {
+            finishAccessibilityProbe();
+            return errJson(QStringLiteral("focus_not_confirmed"));
+        }
+        QTimer::singleShot(1500, this, [this, lease]() {
+            if (m_probeLease == lease) {
+                finishAccessibilityProbe();
+            }
+        });
+        QJsonObject object;
+        object["ok"] = true;
+        object["lease"] = static_cast<qint64>(lease);
+        object["epoch"] = static_cast<qint64>(m_probeEpoch);
+        return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    }
+
+    Q_SCRIPTABLE QString AdvanceAccessibilityProbe(qint64 lease)
+    {
+        if (!callerAllowed() || (calledFromDBus() && message().service() != m_probeCaller)) {
+            return errJson(QStringLiteral("not_authorized"));
+        }
+        if (lease <= 0 || static_cast<quint64>(lease) != m_probeLease || m_probePhase >= 3) {
+            return errJson(QStringLiteral("probe_expired"));
+        }
+        if (!accessibilityProbeOwned()) {
+            finishAccessibilityProbe();
+            return errJson(QStringLiteral("focus_changed_during_probe"));
+        }
+        ++m_probePhase;
+        // requestFocus omits ActivityRaise. Repeat leave/enter once to reject
+        // delayed activation events. No key, pointer or click is sent.
+        bool focused = true;
+        if (m_probePhase % 2) {
+            focused = m_probeTarget && KWin::workspace()->requestFocus(m_probeTarget, true);
+        } else {
+            KWin::workspace()->activateWindow(nullptr);
+        }
+        m_probeEpoch = m_focusEpoch;
+        if (!focused || !accessibilityProbeOwned()) {
+            finishAccessibilityProbe();
+            return errJson(QStringLiteral("focus_not_confirmed"));
+        }
+        QJsonObject object;
+        object["ok"] = true;
+        object["epoch"] = static_cast<qint64>(m_probeEpoch);
+        return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact));
+    }
+
+    Q_SCRIPTABLE QString EndAccessibilityProbe(qint64 lease)
+    {
+        if (!callerAllowed() || (calledFromDBus() && message().service() != m_probeCaller)) {
+            return errJson(QStringLiteral("not_authorized"));
+        }
+        if (lease <= 0 || static_cast<quint64>(lease) != m_probeLease) {
+            return errJson(QStringLiteral("probe_expired"));
+        }
+        const bool stable = finishAccessibilityProbe();
+        QJsonObject object;
+        object["ok"] = stable;
+        object["reason"] = stable ? "" : "focus_changed_during_probe";
+        return QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact));
     }
 
     Q_SCRIPTABLE QString GetWindows()
@@ -1333,6 +1446,70 @@ public slots:
     }
 
 private:
+    qint64 keyboardFocusToken()
+    {
+        auto *surface = KWin::waylandServer()->seat()->focusedKeyboardSurface();
+        if (!surface) {
+            return 0;
+        }
+        surface = surface->mainSurface();
+        for (auto *window : KWin::workspace()->windows()) {
+            if (window && !window->isDeleted() && window->surface() == surface) {
+                return static_cast<qint64>(tokenFor(window->internalId()));
+            }
+        }
+        return 0;
+    }
+
+    bool accessibilityProbeOwned()
+    {
+        if (!m_probeLease || m_focusEpoch != m_probeEpoch) {
+            return false;
+        }
+        if (m_probePhase % 2) {
+            return m_probeTarget && !m_probeTarget->isDeleted()
+                && KWin::workspace()->activeWindow() == m_probeTarget
+                && keyboardFocusToken() == static_cast<qint64>(tokenFor(m_probeTarget->internalId()));
+        }
+        return !KWin::workspace()->activeWindow() && keyboardFocusToken() == 0;
+    }
+
+    bool finishAccessibilityProbe()
+    {
+        if (!m_probeLease) {
+            return false;
+        }
+        const bool owned = accessibilityProbeOwned();
+        const bool complete = m_probePhase == 3;
+        // A user's focus change supersedes the borrowed focus. Never steal it
+        // back or restack windows after that change.
+        if (owned) {
+            QList<KWin::Window *> order;
+            for (const auto &window : std::as_const(m_probeOrder)) {
+                if (window && !window->isDeleted()) {
+                    order.push_back(window);
+                }
+            }
+            if (order != KWin::workspace()->stackingOrder()) {
+                restoreStacking(order);
+            }
+            if (m_probePrevious && !m_probePrevious->isDeleted()) {
+                KWin::workspace()->requestFocus(m_probePrevious, true);
+            } else {
+                KWin::workspace()->activateWindow(nullptr);
+            }
+        }
+        const bool restored = KWin::workspace()->activeWindow() == m_probePrevious
+            && keyboardFocusToken() == m_probePreviousKeyboard;
+        m_probeLease = 0;
+        m_probeTarget = nullptr;
+        m_probePrevious = nullptr;
+        m_probeOrder.clear();
+        m_probeCaller.clear();
+        m_inputBusy = false;
+        return owned && complete && restored;
+    }
+
     bool callerAllowed()
     {
         if (!calledFromDBus()) {
@@ -1448,6 +1625,16 @@ private:
     }
 
     bool m_inputBusy = false;
+    quint64 m_focusEpoch = 1;
+    quint64 m_probeEpoch = 0;
+    quint64 m_probeLease = 0;
+    quint64 m_nextProbeLease = 0;
+    unsigned int m_probePhase = 0;
+    qint64 m_probePreviousKeyboard = 0;
+    QString m_probeCaller;
+    QPointer<KWin::Window> m_probePrevious;
+    QPointer<KWin::Window> m_probeTarget;
+    QList<QPointer<KWin::Window>> m_probeOrder;
     QPointer<KWin::KeyboardInputRedirection> m_keyboardOwner;
     QSet<uint32_t> m_ownedKeys;
     QUuid m_keyFocusId;

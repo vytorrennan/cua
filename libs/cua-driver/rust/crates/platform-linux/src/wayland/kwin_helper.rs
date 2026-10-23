@@ -87,6 +87,72 @@ pub fn available() -> bool {
     helper_owner().is_some()
 }
 
+fn helper_json(owner: &str, method: &str, args: &[String]) -> Option<serde_json::Value> {
+    let raw = call_to(owner, method, args)?;
+    serde_json::from_str(&parse_quoted_string(&raw)?).ok()
+}
+
+/// Own one bounded focus calibration. Drop releases it even when the AT-SPI
+/// future is cancelled by its caller's deadline. The effect also has a timer.
+pub(crate) struct AccessibilityProbe {
+    owner: String,
+    lease: u64,
+    finished: bool,
+}
+
+impl AccessibilityProbe {
+    pub(crate) fn begin(pid: u32, token: u64) -> Option<Self> {
+        let info = helper_info()?;
+        if info.version < 4 || trusted_window_for_id(pid, token).is_none() {
+            return None;
+        }
+        let response = helper_json(&info.owner, "BeginAccessibilityProbe", &[token.to_string()])?;
+        if !response.get("ok")?.as_bool()? {
+            return None;
+        }
+        Some(Self {
+            owner: info.owner,
+            lease: response.get("lease")?.as_u64()?,
+            finished: false,
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> bool {
+        self.finished = true;
+        helper_json(
+            &self.owner,
+            "EndAccessibilityProbe",
+            &[self.lease.to_string()],
+        )
+        .and_then(|response| response.get("ok").and_then(|v| v.as_bool()))
+        .unwrap_or(false)
+    }
+
+    pub(crate) fn advance(&self) -> Option<()> {
+        let response = helper_json(
+            &self.owner,
+            "AdvanceAccessibilityProbe",
+            &[self.lease.to_string()],
+        )?;
+        if !response.get("ok")?.as_bool()? {
+            return None;
+        }
+        Some(())
+    }
+}
+
+impl Drop for AccessibilityProbe {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = helper_json(
+                &self.owner,
+                "EndAccessibilityProbe",
+                &[self.lease.to_string()],
+            );
+        }
+    }
+}
+
 pub fn list_windows() -> Option<Vec<KwinWindow>> {
     snapshot_for_owner(&helper_owner()?)
 }
@@ -1186,7 +1252,7 @@ fn native_call_body(
     use zbus::zvariant::{StructureBuilder, Value};
     let signature = match method {
         "GetNameOwner" | "GetConnectionUnixProcessID" | "GetConnectionUnixUser" => "s",
-        "Activate" => "x",
+        "Activate" | "BeginAccessibilityProbe" | "AdvanceAccessibilityProbe" | "EndAccessibilityProbe" => "x",
         "Move" | "MouseMoveBackground" | "MouseButtonUpBackground" => "xii",
         "MovePointer" => "dd",
         "Click" | "ClickBackground" => "xiiui",
@@ -1197,7 +1263,7 @@ fn native_call_body(
         "SetWindowFrame" => "xiiii",
         "MouseButtonDownBackground" => "xiiu",
         "GetVersion" | "GetBuild" | "GetWindows" | "GetActiveToken" | "GetPointer"
-        | "GetScreenGeometry" => "",
+        | "GetScreenGeometry" | "GetFocusState" => "",
         _ => return None,
     };
     if signature.len() != args.len() {

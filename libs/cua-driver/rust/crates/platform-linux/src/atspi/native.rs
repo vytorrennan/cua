@@ -1115,30 +1115,56 @@ fn correlate_kwin_frame(
     if let Some(ordinal) = correlate_hyprland_frame(&title_backed, &clients, target) {
         return Some(ordinal);
     }
-    let (_, window_x, window_y, window_width, window_height) = windows[target];
-    let mut scored: Vec<(u64, usize)> = frames
-        .iter()
-        .filter_map(|frame| {
-            let (x, y, width, height) = frame.extents;
-            if width <= 0 || height <= 0 {
-                return None;
-            }
-            let distance = (i64::from(x) - i64::from(window_x)).unsigned_abs()
-                + (i64::from(y) - i64::from(window_y)).unsigned_abs()
-                + (i64::from(width) - i64::from(window_width)).unsigned_abs()
-                + (i64::from(height) - i64::from(window_height)).unsigned_abs();
-            Some((distance, frame.ordinal))
-        })
-        .collect();
-    scored.sort_by_key(|(distance, ordinal)| (*distance, *ordinal));
-    let (best_distance, best_ordinal) = *scored.first()?;
-    if best_distance > FRAME_MATCH_TOLERANCE_PX {
-        return None;
-    }
-    if let Some((runner_up, _)) = scored.get(1) {
-        if runner_up.saturating_sub(best_distance) < FRAME_MATCH_MARGIN_PX {
+    let distance = |frame: &KwinFrame, window: &(&str, i32, i32, i32, i32)| {
+        let (x, y, width, height) = frame.extents;
+        let &(_, window_x, window_y, window_width, window_height) = window;
+        if width <= 0 || height <= 0 || window_width <= 0 || window_height <= 0 {
             return None;
         }
+        // Native Wayland clients expose local (0,0) extents even when asked
+        // for screen coordinates. Comparing that origin to desktop placement
+        // rejects valid dialogs and can misidentify a partly published app.
+        let position = if x == 0 && y == 0 {
+            0
+        } else {
+            (i64::from(x) - i64::from(window_x)).unsigned_abs()
+                + (i64::from(y) - i64::from(window_y)).unsigned_abs()
+        };
+        Some(
+            position
+                + (i64::from(width) - i64::from(window_width)).unsigned_abs()
+                + (i64::from(height) - i64::from(window_height)).unsigned_abs(),
+        )
+    };
+    let mut scored: Vec<(u64, usize)> = frames
+        .iter()
+        .filter_map(|frame| distance(frame, &windows[target]).map(|d| (d, frame.ordinal)))
+        .collect();
+    scored.sort_by_key(|(d, ordinal)| (*d, *ordinal));
+    let (best_distance, best_ordinal) = *scored.first()?;
+    if best_distance > FRAME_MATCH_TOLERANCE_PX
+        || scored.get(1).is_some_and(|(runner_up, _)| {
+            runner_up.saturating_sub(best_distance) < FRAME_MATCH_MARGIN_PX
+        })
+    {
+        return None;
+    }
+    // Require the reverse match too. One currently published frame cannot
+    // identify either of two equal-size native windows at different positions.
+    let selected = frames.iter().find(|frame| frame.ordinal == best_ordinal)?;
+    let mut reverse: Vec<_> = windows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, window)| distance(selected, window).map(|d| (d, index)))
+        .collect();
+    reverse.sort_unstable();
+    let &(reverse_best, reverse_target) = reverse.first()?;
+    if reverse_target != target
+        || reverse.get(1).is_some_and(|(runner_up, _)| {
+            runner_up.saturating_sub(reverse_best) < FRAME_MATCH_MARGIN_PX
+        })
+    {
+        return None;
     }
     Some(best_ordinal)
 }
@@ -1193,6 +1219,28 @@ mod kwin_frame_tests {
         let frames = [frame(0, "Far", (2000, 2000, 800, 600))];
         let windows = [("Zero", 0, 0, 800, 600)];
         assert_eq!(correlate_kwin_frame(&frames, &windows, 0), None);
+    }
+
+    #[test]
+    fn local_wayland_coordinates_match_client_size_at_any_desktop_position() {
+        let frames = [
+            frame(0, "Accessible parent", (0, 0, 640, 480)),
+            frame(1, "Accessible dialog", (0, 0, 960, 540)),
+        ];
+        let windows = [
+            ("Native parent", 700, 300, 640, 508),
+            ("Native dialog", 480, 255, 960, 568),
+        ];
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 0), Some(0));
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 1), Some(1));
+    }
+
+    #[test]
+    fn one_published_frame_cannot_identify_two_equal_size_native_windows() {
+        let frames = [frame(0, "Accessible", (0, 0, 800, 600))];
+        let windows = [("First", 0, 0, 800, 600), ("Second", 700, 300, 800, 600)];
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 0), None);
+        assert_eq!(correlate_kwin_frame(&frames, &windows, 1), None);
     }
 }
 
@@ -1283,6 +1331,164 @@ mod hyprland_frame_tests {
     }
 }
 
+fn kwin_bindings() -> &'static Mutex<super::kwin_identity::WindowBindings> {
+    static BINDINGS: OnceLock<Mutex<super::kwin_identity::WindowBindings>> = OnceLock::new();
+    BINDINGS.get_or_init(|| Mutex::new(super::kwin_identity::WindowBindings::default()))
+}
+
+/// Query active state directly; event delivery order is not an identity proof.
+async fn active_kwin_frames(
+    conn: &AccessibilityConnection,
+    seeds: &[RawObjectRef],
+    ordinals: &[usize],
+) -> Option<Vec<usize>> {
+    let mut active = Vec::new();
+    for &ordinal in ordinals {
+        let acc = call(accessible_for(conn, seeds.get(ordinal)?))
+            .await?
+            .ok()?;
+        let state = call(acc.get_state()).await?.ok()?;
+        if state.contains(State::Active) && !state.contains(State::Defunct) {
+            active.push(ordinal);
+        }
+    }
+    Some(active)
+}
+
+async fn resolve_kwin_frame(
+    conn: &AccessibilityConnection,
+    pid: u32,
+    token: u64,
+    seeds: &[RawObjectRef],
+) -> Option<usize> {
+    use crate::wayland::kwin_helper::{self, AccessibilityProbe};
+    let windows = kwin_helper::list_windows()?;
+    let owned: Vec<_> = windows.iter().filter(|window| window.pid == pid).collect();
+    let target = owned.iter().position(|window| window.token == token)?;
+    let handle = &owned[target].handle;
+    let objects: Vec<_> = seeds
+        .iter()
+        .map(|r| (r.name.clone(), r.path.clone()))
+        .collect();
+    let live: Vec<_> = windows.iter().map(|w| (w.pid, w.handle.clone())).collect();
+    let cached = {
+        let mut bindings = kwin_bindings().lock().ok()?;
+        bindings.retain_live(&live, pid, &objects);
+        bindings.resolve(pid, handle, &objects)
+    };
+    if let Some(ordinal) = cached {
+        let acc = call(accessible_for(conn, &seeds[ordinal])).await?.ok()?;
+        if !call(acc.get_state()).await?.ok()?.contains(State::Defunct) {
+            return Some(ordinal);
+        }
+    }
+
+    let chromium = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .is_some_and(|name| crate::browser_platform::is_chromium_identity(&name));
+    let mut frames = Vec::new();
+    for (ordinal, oref) in seeds.iter().enumerate() {
+        let acc = call(accessible_for(conn, oref)).await?.ok()?;
+        let role = call(acc.get_role_name()).await?.ok()?;
+        if !matches!(
+            role.as_str(),
+            "frame" | "window" | "dialog" | "alert" | "file chooser"
+        ) {
+            continue;
+        }
+        let state = call(acc.get_state()).await?.ok()?;
+        if state.contains(State::Defunct) {
+            continue;
+        }
+        let title = call(acc.name()).await?.ok()?;
+        let browser_root = chromium
+            && call(acc.get_attributes())
+                .await?
+                .ok()?
+                .get("class")
+                .is_some_and(|class| class == "BrowserRootView");
+        let proxies = call(acc.proxies()).await?.ok()?;
+        let component = match call(proxies.component()).await {
+            Some(Ok(component)) => component,
+            _ => continue,
+        };
+        let extents = match call(component.get_extents(CoordType::Screen)).await {
+            Some(Ok(extents)) => extents,
+            _ => continue,
+        };
+        frames.push(KwinFrame {
+            ordinal,
+            title,
+            browser_root,
+            size: browser_root.then_some((extents.2, extents.3)),
+            extents,
+        });
+    }
+    let remember = |ordinal: usize, native_handle: &str| -> Option<usize> {
+        kwin_bindings()
+            .lock()
+            .ok()?
+            .remember(pid, native_handle, objects.get(ordinal)?.clone());
+        Some(ordinal)
+    };
+    let clients: Vec<_> = owned
+        .iter()
+        .map(|w| (w.title.as_str(), w.x, w.y, w.width as i32, w.height as i32))
+        .collect();
+    if let Some(ordinal) = correlate_kwin_frame(&frames, &clients, target) {
+        return remember(ordinal, handle);
+    }
+
+    // Only an unresolved first observation borrows focus. Cache hits above
+    // survive title/size/focus changes without moving focus again.
+    if remaining_budget() < Duration::from_millis(500) {
+        return None;
+    }
+    let probe = AccessibilityProbe::begin(pid, token)?;
+    let deadline = tokio::time::Instant::now()
+        + remaining_budget()
+            .saturating_sub(Duration::from_millis(150))
+            .min(Duration::from_millis(1100));
+    let ordinals: Vec<_> = frames.iter().map(|frame| frame.ordinal).collect();
+    let mut matched = None;
+    for phase in 0..4 {
+        let mut acknowledged = false;
+        while tokio::time::Instant::now() < deadline {
+            let candidates = active_kwin_frames(conn, seeds, &ordinals).await?;
+            // Advance/finish validate the compositor epoch and exact native
+            // keyboard target after this acknowledgement. Avoid a redundant
+            // status RPC in every poll while retaining that final guard.
+            if phase % 2 == 0 && candidates.is_empty() {
+                acknowledged = true;
+                break;
+            }
+            if phase % 2 == 1 && candidates.len() == 1 {
+                if phase == 3 && matched != Some(candidates[0]) {
+                    return None;
+                }
+                matched = Some(candidates[0]);
+                acknowledged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !acknowledged {
+            return None;
+        }
+        if phase != 3 {
+            probe.advance()?;
+        }
+    }
+    if probe.finish() {
+        return remember(matched?, handle);
+    }
+    None
+}
+
 /// Resolve native window `xid` to the ordinal of the application top-level that
 /// renders it, or `None` when that cannot be proven. `None` means the walk stays
 /// application-wide: callers that merely want a tree carry on, and callers that
@@ -1350,67 +1556,7 @@ async fn resolve_window_frame(
         && !crate::wayland::hyprland::is_session()
         && crate::wayland::kwin_helper::available()
     {
-        if let Some(windows) = crate::wayland::kwin_helper::list_windows() {
-            let owned: Vec<_> = windows.iter().filter(|window| window.pid == pid).collect();
-            if let Some(target) = owned.iter().position(|window| window.token == xid) {
-                let chromium = std::fs::read_link(format!("/proc/{pid}/exe"))
-                    .ok()
-                    .and_then(|path| {
-                        path.file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                    })
-                    .is_some_and(|name| crate::browser_platform::is_chromium_identity(&name));
-                let mut frames = Vec::new();
-                for (ordinal, oref) in seeds.iter().enumerate() {
-                    let acc = call(accessible_for(conn, oref)).await?.ok()?;
-                    let role = call(acc.get_role_name()).await?.ok()?;
-                    if !matches!(
-                        role.as_str(),
-                        "frame" | "window" | "dialog" | "alert" | "file chooser"
-                    ) {
-                        continue;
-                    }
-                    let title = call(acc.name()).await?.ok()?;
-                    let browser_root = if chromium {
-                        call(acc.get_attributes())
-                            .await?
-                            .ok()?
-                            .get("class")
-                            .is_some_and(|class| class == "BrowserRootView")
-                    } else {
-                        false
-                    };
-                    let proxies = call(acc.proxies()).await?.ok()?;
-                    let component = call(proxies.component()).await?.ok()?;
-                    let (x, y, width, height) =
-                        call(component.get_extents(CoordType::Screen)).await?.ok()?;
-                    frames.push(KwinFrame {
-                        ordinal,
-                        title,
-                        browser_root,
-                        size: browser_root.then_some((width, height)),
-                        extents: (x, y, width, height),
-                    });
-                }
-                let clients = owned
-                    .iter()
-                    .map(|window| {
-                        (
-                            window.title.as_str(),
-                            window.x,
-                            window.y,
-                            window.width as i32,
-                            window.height as i32,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                return correlate_kwin_frame(&frames, &clients, target);
-            }
-        }
-        // A KWin token is not an X11 XID. An unresolved match must not
-        // fall through to the singleton/X11 heuristics below, which could
-        // attribute the parent frame's controls to an unrelated dialog.
-        return None;
+        return resolve_kwin_frame(conn, pid, xid, seeds).await;
     }
     if seeds.len() == 1 {
         // One top-level: the caller's window is the only thing this
@@ -1577,12 +1723,10 @@ async fn collect_visited_bounded_opts<'a>(
         resolve_window_frame(conn, pid, xid, &seeds).await
     };
 
-    // Walk the caller's window FIRST when it was resolved: under a short
-    // budget an application-wide pre-order (main window, then dialogs) could
-    // exhaust the budget before ever reaching the dialog the caller asked
-    // about. Ordinals stay the application's own, so `render` still scopes
-    // by the same identity; only the visiting order (and thus the index
-    // space of this snapshot) changes.
+    // Once identity is proved, walk only the requested window. An unrelated
+    // sibling can be slow or unresponsive and must not consume this window's
+    // budget or make its complete tree look truncated. Keep the application's
+    // own frame ordinal so rendering and object identities stay consistent.
     let mut ordered: Vec<(RawObjectRef, usize, bool, usize)> = seeds
         .iter()
         .cloned()
@@ -1590,13 +1734,7 @@ async fn collect_visited_bounded_opts<'a>(
         .map(|(ordinal, r)| (r, 0usize, false, ordinal))
         .collect();
     if let Some(scope) = scoped_frame {
-        if let Some(position) = ordered
-            .iter()
-            .position(|(_, _, _, ordinal)| *ordinal == scope)
-        {
-            let scoped = ordered.remove(position);
-            ordered.insert(0, scoped);
-        }
+        ordered.retain(|(_, _, _, ordinal)| *ordinal == scope);
     }
     let mut stack: Vec<(RawObjectRef, usize, bool, usize)> = ordered.into_iter().rev().collect();
     // Direct children of a `menu bar`: a top-level menu whose popup is not
@@ -3895,23 +4033,13 @@ where
 pub fn kwin_client_origin(pid: u32, xid: u64) -> Result<Option<(i32, i32)>> {
     let windows = crate::wayland::kwin_helper::list_windows()
         .ok_or_else(|| anyhow!("KWin window list unavailable"))?;
-    let owned: Vec<&crate::wayland::kwin_helper::KwinWindow> = windows
-        .iter()
-        .filter(|window| window.pid == pid)
-        .collect();
+    let owned: Vec<&crate::wayland::kwin_helper::KwinWindow> =
+        windows.iter().filter(|window| window.pid == pid).collect();
     let target_index = owned
         .iter()
         .position(|window| window.token == xid)
         .ok_or_else(|| anyhow!("KWin window {xid} does not belong to pid {pid}"))?;
     let target_window = owned[target_index];
-    let chromium = std::fs::read_link(format!("/proc/{pid}/exe"))
-        .ok()
-        .and_then(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-        })
-        .is_some_and(|name| crate::browser_platform::is_chromium_identity(&name));
-
     bounded_for(
         Duration::from_secs(12),
         async {
@@ -3939,105 +4067,15 @@ pub fn kwin_client_origin(pid: u32, xid: u64) -> Result<Option<(i32, i32)>> {
             if seeds.is_empty() {
                 return Ok(None);
             }
-            let mut frames = Vec::new();
-            for (ordinal, oref) in seeds.iter().enumerate() {
-                let acc = match call(accessible_for(conn, oref)).await {
-                    Some(Ok(acc)) => acc,
-                    _ => continue,
-                };
-                let role = call(acc.get_role_name())
-                    .await
-                    .and_then(|role| role.ok())
-                    .unwrap_or_default();
-                if !matches!(
-                    role.as_str(),
-                    "frame" | "window" | "dialog" | "alert" | "file chooser"
-                ) {
-                    continue;
-                }
-                let title = call(acc.name())
-                    .await
-                    .and_then(|name| name.ok())
-                    .unwrap_or_default();
-                let browser_root = if chromium {
-                    call(acc.get_attributes())
-                        .await
-                        .and_then(|attrs| attrs.ok())
-                        .and_then(|attrs| {
-                            attrs.get("class").map(|class| class == "BrowserRootView")
-                        })
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                let extents = match call(acc.proxies()).await {
-                    Some(Ok(proxies)) => match call(proxies.component()).await {
-                        Some(Ok(component)) => call(component.get_extents(CoordType::Screen))
-                            .await
-                            .and_then(|extents| extents.ok()),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                if let Some((x, y, width, height)) = extents {
-                    frames.push(KwinFrame {
-                        ordinal,
-                        title,
-                        browser_root,
-                        size: browser_root.then_some((width, height)),
-                        extents: (x, y, width, height),
-                    });
-                }
-            }
-            let clients: Vec<(&str, i32, i32, i32, i32)> = owned
-                .iter()
-                .map(|window| {
-                    (
-                        window.title.as_str(),
-                        window.x,
-                        window.y,
-                        window.width as i32,
-                        window.height as i32,
-                    )
-                })
-                .collect();
-            let ordinal = match correlate_kwin_frame(&frames, &clients, target_index) {
+            let ordinal = match resolve_window_frame(conn, pid, xid, &seeds).await {
                 Some(ordinal) => ordinal,
-                None => {
-                    // Wayland clients report frame extents relative to their
-                    // own client area (0,0), so the screen-position term in
-                    // `correlate_kwin_frame` cannot match. Captions and client
-                    // sizes still identify the window; collapse whitespace
-                    // because Qt's accessible name often doubles a space.
-                    let normalize = |value: &str| {
-                        value.split_whitespace().collect::<Vec<_>>().join(" ")
-                    };
-                    let target_title = normalize(&target_window.title);
-                    let size_distance = |frame: &KwinFrame| {
-                        (frame.extents.2 - target_window.width as i32).unsigned_abs() as u64
-                            + (frame.extents.3 - target_window.height as i32).unsigned_abs() as u64
-                    };
-                    let mut candidates: Vec<&KwinFrame> = frames
-                        .iter()
-                        .filter(|frame| normalize(&frame.title) == target_title)
-                        .collect();
-                    if candidates.is_empty() {
-                        candidates = frames.iter().collect();
-                    }
-                    candidates.sort_by_key(|frame| size_distance(frame));
-                    match candidates.first() {
-                        Some(frame) if frames.len() == 1 || size_distance(frame) <= 160 => {
-                            frame.ordinal
-                        }
-                        _ => return Ok(None),
-                    }
-                }
-            };
-            let frame = match frames.iter().find(|frame| frame.ordinal == ordinal) {
-                Some(frame) => frame,
                 None => return Ok(None),
             };
-            let (frame_x, frame_y, frame_width, frame_height) = frame.extents;
+            let acc = accessible_for(conn, &seeds[ordinal]).await?;
+            let proxies = acc.proxies().await?;
+            let component = proxies.component().await?;
+            let (frame_x, frame_y, frame_width, frame_height) =
+                component.get_extents(CoordType::Screen).await?;
             if frame_width <= 0 || frame_height <= 0 {
                 return Ok(None);
             }

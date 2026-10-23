@@ -12,6 +12,7 @@
 use self::snapshot as cache;
 use anyhow::Result;
 
+mod kwin_identity;
 pub mod native;
 pub mod snapshot;
 pub use native::ensure_listener_active;
