@@ -1337,6 +1337,9 @@ impl Tool for GetWindowStateTool {
         let state = self.state.clone();
         let state_for_capture = state.clone();
         let query_for_walk = query.clone();
+        let require_window_scope = crate::wayland::is_wayland()
+            && (crate::wayland::hyprland::is_session()
+                || crate::wayland::kwin_helper::available());
 
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             // Skip the AT-SPI walk on the capture-only path
@@ -1486,7 +1489,11 @@ impl Tool for GetWindowStateTool {
                 let mut published_snapshot = false;
                 let mut invalidated = Vec::new();
 
-                if let Some(tr) = tree_opt {
+                if let Some(mut tr) = tree_opt {
+                    let target_scoped = !require_window_scope || tr.require_window_scope();
+                    if require_window_scope {
+                        structured["accessibility_window_scoped"] = json!(target_scoped);
+                    }
                     let source_trusted = tr.trusted;
                     let source_degraded_reason = tr.degraded_reason.clone();
                     let count = tr
@@ -1506,7 +1513,7 @@ impl Tool for GetWindowStateTool {
                             tr.nodes_pending,
                         ));
                         header.push('\n');
-                    } else if !tr.bounds_complete {
+                    } else if target_scoped && !tr.bounds_complete {
                         header.push_str(
                             "⚠️ bounds phase ran out of time: some elements have no frame \
                              (element_token clicks still work; pixel targeting may not). \
@@ -1522,7 +1529,8 @@ impl Tool for GetWindowStateTool {
                     // finished without hitting the deadline / node budget saw
                     // every node the application publishes. Truncated or
                     // fallback trees keep negative existence unknown.
-                    structured["elements_complete"] = json!(tr.trusted && !tr.truncated);
+                    structured["elements_complete"] =
+                        json!(target_scoped && tr.trusted && !tr.truncated);
                     structured["truncated"] = json!(tr.truncated);
                     if let Some(reason) = &tr.truncation_reason {
                         structured["truncation_reason"] = json!(reason);
@@ -1534,9 +1542,6 @@ impl Tool for GetWindowStateTool {
                     structured["timeout_ms"] = json!(timeout_ms);
                     structured["tree_markdown"] = json!(tr.tree_markdown);
 
-                    let target_scoped = !(crate::wayland::is_wayland()
-                        && crate::wayland::hyprland::is_session())
-                        || tr.window_scoped;
                     if !observation_only && !target_scoped {
                         invalidated.extend(state.snapshots.remove(pid as i32, xid));
                         crate::atspi::snapshot::forget_window(pid, xid);
@@ -1653,7 +1658,7 @@ impl Tool for GetWindowStateTool {
                     // degraded so callers don't read `elements: []` as authoritative.
                     if !target_scoped {
                         structured["degraded"] = json!(true);
-                        structured["degraded_reason"] = json!("accessibility_window_identity_unproven: tree is application-scoped; exact-window element tokens and bounds are unavailable");
+                        structured["degraded_reason"] = json!("accessibility_window_identity_unproven: the AT-SPI frame could not be uniquely bound to the requested native window; unrelated rows were withheld");
                     } else if !source_trusted {
                         structured["degraded"] = json!(true);
                         structured["degraded_reason"] = json!(source_degraded_reason

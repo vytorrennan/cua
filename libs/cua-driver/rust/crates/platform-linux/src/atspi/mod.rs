@@ -101,6 +101,29 @@ pub struct AtspiTreeResult {
 pub const DEFAULT_WALK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
 impl AtspiTreeResult {
+    /// Require proof that all rows belong to one exact native window.
+    pub(crate) fn require_window_scope(&mut self) -> bool {
+        if self.window_scoped {
+            return true;
+        }
+        // Application-wide rows are not a partial view of the requested
+        // window. Discard them before publishing text, geometry or tokens.
+        self.nodes.clear();
+        self.bounds.clear();
+        self.tree_markdown = "Accessibility unavailable: the requested window could not be \
+            uniquely matched. Use the screenshot or request a window with a distinct title \
+            or size.\n"
+            .to_owned();
+        self.trusted = false;
+        self.bounds_complete = false;
+        self.degraded_reason = Some(
+            "accessibility_window_identity_unproven: the AT-SPI \
+            frame could not be uniquely bound to the requested native window"
+                .to_owned(),
+        );
+        false
+    }
+
     fn from_walked(walked: native::WalkedTree, query: Option<&str>) -> Self {
         let md = match query {
             Some(q) => filter_tree(&walked.markdown, q),
@@ -878,5 +901,81 @@ mod budget_tests {
         assert!(!result.truncated);
         assert_eq!(result.nodes_visited, 0);
         assert!(result.bounds_complete);
+    }
+}
+
+#[cfg(test)]
+mod window_scope_tests {
+    use super::*;
+
+    fn tree(window_scoped: bool) -> AtspiTreeResult {
+        AtspiTreeResult {
+            tree_markdown: "- [0] button \"OTHER_WINDOW_PRIVATE_VALUE\"\n".into(),
+            nodes: vec![AtspiNode {
+                element_index: Some(0),
+                role: "button".into(),
+                name: Some("OTHER_WINDOW_PRIVATE_VALUE".into()),
+                value: None,
+                checked: None,
+                enabled: Some(true),
+                selected: None,
+                description: None,
+                actions: vec!["click".into()],
+                element_key: 0,
+                identity: None,
+                depth: 0,
+                parent_element_index: None,
+                in_web_content: false,
+                object_ref: None,
+            }],
+            bounds: vec![(0, 10, 20, 30, 40)],
+            trusted: true,
+            degraded_reason: None,
+            window_scoped,
+            truncated: false,
+            truncation_reason: None,
+            nodes_visited: 1,
+            nodes_pending: 0,
+            bounds_complete: true,
+            elapsed_ms: 12,
+        }
+    }
+
+    #[test]
+    fn unproven_window_discards_rows_bounds_and_private_text() {
+        let mut result = tree(false);
+        assert!(!result.require_window_scope());
+        assert!(
+            result.nodes.is_empty(),
+            "unrelated rows must not reach publication"
+        );
+        assert!(result.bounds.is_empty());
+        assert!(!result.tree_markdown.contains("OTHER_WINDOW_PRIVATE_VALUE"));
+        assert!(!result.trusted);
+        assert!(!result.bounds_complete);
+        assert!(result
+            .degraded_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("accessibility_window_identity_unproven:"));
+        assert!(
+            !result.require_window_scope(),
+            "repeated enforcement remains unproven"
+        );
+    }
+
+    #[test]
+    fn proven_window_preserves_rows_bounds_and_existing_partial_state() {
+        let mut result = tree(true);
+        result.truncated = true;
+        result.truncation_reason = Some("timeout".into());
+        assert!(result.require_window_scope());
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.bounds, vec![(0, 10, 20, 30, 40)]);
+        assert!(result.tree_markdown.contains("OTHER_WINDOW_PRIVATE_VALUE"));
+        assert!(result.trusted);
+        assert!(result.truncated);
+        assert_eq!(result.truncation_reason.as_deref(), Some("timeout"));
+        assert_eq!(result.elapsed_ms, 12);
     }
 }

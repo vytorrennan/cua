@@ -1404,11 +1404,13 @@ async fn resolve_window_frame(
                         )
                     })
                     .collect::<Vec<_>>();
-                if let Some(ordinal) = correlate_kwin_frame(&frames, &clients, target) {
-                    return Some(ordinal);
-                }
+                return correlate_kwin_frame(&frames, &clients, target);
             }
         }
+        // A KWin token is not an X11 XID. An unresolved match must not
+        // fall through to the singleton/X11 heuristics below, which could
+        // attribute the parent frame's controls to an unrelated dialog.
+        return None;
     }
     if seeds.len() == 1 {
         // One top-level: the caller's window is the only thing this

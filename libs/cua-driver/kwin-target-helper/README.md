@@ -71,6 +71,16 @@ closes the window, and aborted requests release their owned keys. Overlapping
 writes return `input_busy` while metadata remains readable. The driver does
 not replay dispatched input automatically after a transport error.
 
+Accessibility rows require an independently matched native window. When two
+windows share a title and size, the driver can still return the exact window
+screenshot, but withholds an unproven application-wide tree. The response marks
+`accessibility_window_scoped: false`, `elements_complete: false` and
+`degraded_reason: accessibility_window_identity_unproven: ...`, with no
+unrelated rows or actionable element snapshot. Previous element snapshots for
+that window are invalidated. A screenshot-only read cannot revive their tokens.
+Use screenshot coordinates while the accessibility identity is unresolved.
+A uniquely matched title or geometry keeps normal accessibility rows available.
+
 Bulk text and Unicode use clipboard paste. Clipboard transactions preserve
 native payload formats, support empty selections and retain a different text
 value copied during dispatch. Konsole uses Ctrl+Shift+V. Short text and control
